@@ -1,0 +1,24 @@
+{
+  "is_convex_hull": true,
+  "is_ring": true,
+  "measurement_axis": "Y",
+  "name": "wrist",
+  "selection": [
+5740,
+    5695,
+    5689,
+    5534,
+    5480,
+    5571,
+    5560,
+    5559,
+    5561,
+    5562,
+    5550,
+    5521,
+    5520,
+    5569,
+    5667
+  ],
+  "type": "VertexTrace"
+}

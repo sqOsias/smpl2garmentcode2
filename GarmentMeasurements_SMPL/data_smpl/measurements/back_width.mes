@@ -1,0 +1,90 @@
+{
+  "convex_hull_normal": [0.0, 0.0, 1.0],
+  "convex_hull_normal_deviance_min_cos": -0.4,
+  "halfspaces": [
+    {
+      "axes": [
+        {
+          "landmarks": [
+            "bust_side_left",
+            "bust_side_right"
+          ],
+          "type": "landmarks"
+        },
+        {
+          "axis": "Y",
+          "type": "axis"
+        }
+      ],
+      "origin": "bust_side_left"
+    }
+  ],
+  "is_convex_hull": true,
+  "measurement_plane": {
+    "type": "LANDMARKS",
+    "landmarks": ["bust_side_left", "bust_side_right"],
+    "landmarks_second_axis": "Z",
+    "normal_axis": "Y"
+  },
+  "name": "back_width",
+  "num_face_rings": 6,
+  "selection": [
+   3077,
+    2871,
+    691,
+    684,
+    687,
+    942,
+    599,
+    598,
+    669,
+    668,
+    1421,
+    1424,
+    613,
+    1197,
+    1763,
+    1422,
+    644,
+    643,
+    737,
+    763,
+    761,
+    2906,
+    2908,
+    1253,
+    892,
+    1236,
+    750,
+    751,
+    3014,
+    4239,
+    4240,
+    4719,
+    4380,
+    4736,
+    6367,
+    6366,
+    4249,
+    4250,
+    4224,
+    4133,
+    4132,
+    4896,
+    5230,
+    4682,
+    4099,
+    4898,
+    4894,
+    4156,
+    4159,
+    4086,
+    4089,
+    4429,
+    4173,
+    4172,
+    4179,
+    6331
+  ],
+  "type": "AxisAlignedPlanePart"
+}

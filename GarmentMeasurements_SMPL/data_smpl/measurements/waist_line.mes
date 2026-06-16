@@ -1,0 +1,58 @@
+{
+  "convex_hull_normal": [0.0, 0.0, -1.0],
+  "halfspaces": [
+    {
+      "axes": [
+        {
+          "axis": "-Y",
+          "type": "normal"
+        }
+      ],
+      "origin": "nape_of_neck"
+    },
+    {
+      "axes": [
+        {
+          "axis": "Y",
+          "type": "normal"
+        }
+      ],
+      "origin": "mid_waist_back"
+    }
+  ],
+  "is_convex_hull": true,
+  "measurement_plane": {
+    "type": "LANDMARKS",
+    "landmarks": ["nape_of_neck", "mid_waist_back"],
+    "landmarks_second_axis": "Z",
+    "normal_axis": "X"
+  },
+  "name": "waist_line",
+  "num_face_rings": 8,
+  "selection": [
+   3470,
+    3012,
+    1306,
+    1305,
+    2878,
+    2877,
+    3471,
+    1755,
+    1754,
+    3482,
+    3029,
+    3028,
+    3027,
+    3508,
+    3015,
+    3014,
+    3505,
+    3017,
+    3016,
+    3173,
+    3024,
+    3023,
+    3502
+  ],
+  "type": "AxisAlignedPlanePart"
+}

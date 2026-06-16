@@ -1,0 +1,23 @@
+{
+  "is_convex_hull": true,
+  "is_ring": false,
+  "measurement_axis": "Y",
+  "name": "neck_w",
+  "num_face_rings": 6,
+  "selection": [
+    817,
+    803,
+    806,
+    813,
+    812,
+    1219,
+    3470,
+    4702,
+    4302,
+    4301,
+    4292,
+    4291,
+    4305
+  ],
+  "type": "VertexTrace"
+}

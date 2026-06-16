@@ -1,0 +1,33 @@
+{
+  "internal_value": true,
+  "is_ring": true,
+  "measurement_plane": {
+    "normal_axis": "Y",
+    "optimization": "DOWN",
+    "type": "CENTROID"
+  },
+  "name": "leg_circ_left",
+  "num_face_rings": 12,
+  "selection": [
+     847,
+    850,
+    944,
+    854,
+    853,
+    1230,
+    870,
+    900,
+    933,
+    1138,
+    1139,
+    1360,
+    1227,
+    1224,
+    1274,
+    1499,
+    876,
+    875,
+    872
+  ],
+  "type": "AxisAlignedPlane"
+}

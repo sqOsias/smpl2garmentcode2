@@ -1,0 +1,33 @@
+{
+  "internal_value": true,
+  "is_ring": true,
+  "measurement_plane": {
+    "normal_axis": "Y",
+    "optimization": "DOWN",
+    "type": "CENTROID"
+  },
+  "name": "leg_circ_right",
+  "num_face_rings": 12,
+  "selection": [
+   4333,
+    4359,
+    4363,
+    4362,
+    4971,
+    4757,
+    4707,
+    4708,
+    4834,
+    4625,
+    4626,
+    4419,
+    4384,
+    4357,
+    4713,
+    4339,
+    4338,
+    4430,
+    4334
+  ],
+  "type": "AxisAlignedPlane"
+}
