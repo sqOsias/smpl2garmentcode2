@@ -1,0 +1,2 @@
+cd_cm,F-Score@5mm,Precision@5mm,Recall@5mm,F-Score@10mm,Precision@10mm,Recall@10mm,F-Score@20mm,Precision@20mm,Recall@20mm,F-Score@30mm,Precision@30mm,Recall@30mm,F-Score@50mm,Precision@50mm,Recall@50mm
+1.5973,0.0802,0.0804,0.0801,0.3402,0.3269,0.3547,0.7138,0.6809,0.7500,0.9064,0.8856,0.9281,0.9907,0.9875,0.9940
