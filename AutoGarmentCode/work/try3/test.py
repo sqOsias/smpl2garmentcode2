@@ -7,6 +7,8 @@ import trimesh
 import warp as wp
 import warp.sim
 import smplx
+from scipy.spatial.transform import Rotation as R
+import scipy
 
 # 初始化 Warp
 wp.init()
@@ -117,19 +119,16 @@ def compute_particle_masses(verts, faces, density):
     return masses
 
 def find_attachment_points(garment_verts, body_verts, attachment_labels=None):
+    """
+    简单实现：找到服装顶点中距离人体最近的一批顶点作为绑定点
+    实际工程中应根据标签（领口、下摆等）分组匹配
+    """
     attachment_idx = []
     attachment_body_idx = []
-    threshold = 0.005  # 收紧阈值，只选最贴身的顶点
     
-    # 只保留腰部和领口区域（Y轴范围根据你的人体尺寸调整）
-    waist_y_min, waist_y_max = 0.85, 1.05
-    collar_y_min, collar_y_max = 1.45, 1.65
-    
+    # 简化：取距离人体小于阈值的顶点作为绑定点
+    threshold = 0.02
     for i, gv in enumerate(garment_verts):
-        v_y = gv[1]
-        # 不在目标区域直接跳过
-        if not ((waist_y_min < v_y < waist_y_max) or (collar_y_min < v_y < collar_y_max)):
-            continue
         dists = np.linalg.norm(body_verts - gv, axis=1)
         min_dist = dists.min()
         if min_dist < threshold:
@@ -137,6 +136,7 @@ def find_attachment_points(garment_verts, body_verts, attachment_labels=None):
             attachment_body_idx.append(np.argmin(dists))
     
     return np.array(attachment_idx, dtype=np.int32), np.array(attachment_body_idx, dtype=np.int32)
+
 # ======================================
 # 2. SMPL 人体驱动模块
 # ======================================
@@ -215,13 +215,14 @@ def body_collision_kernel(
     if signed_dist < collision_thickness:
         # 沿朝外法线推离，绝对不会把布料推到人体内部
         push = collision_thickness - signed_dist
-        push = wp.min(push, collision_thickness * 0.2)  # 限制单帧推离强度
+        push = wp.min(push, collision_thickness * 0.8)  # 限制单帧推离强度
         cloth_pos[tid] = p + n * push
         
         # 法向速度归零 + 切向摩擦
         vn = wp.dot(v, n) * n
         vt = v - vn
         cloth_vel[tid] = vt * (1.0 - friction)
+
 @wp.kernel
 def attachment_kernel(
     cloth_pos: wp.array(dtype=wp.vec3),
@@ -264,7 +265,7 @@ class WarpClothSimulator:
 
         # ---------- 子步数 & 显式积分稳定性上限 ----------
         # 一帧(1/60s)拆成多个子步以满足显式积分稳定性
-        self.num_substeps = int(sim_config.get("num_substeps", 240))
+        self.num_substeps = int(sim_config.get("num_substeps", 120))
         sub_dt = (1.0 / 60.0) / self.num_substeps
         # 显式法稳定条件（按单节点累计）：刚度 k < m/(N*sub_dt^2)，阻尼 kd < 2m/(N*sub_dt)
         # N 为单节点弹簧数（结构+弯曲叠加，三角网格约 10~12），SAFETY 为安全余量
@@ -287,7 +288,7 @@ class WarpClothSimulator:
 
         # 添加结构弹簧（拉伸）——刚度/阻尼按稳定性上限钳制
         edge_ke = min(float(sim_config["material"]["garment_edge_ke"]), ke_cap)
-        edge_ke = max(edge_ke, 800.0) 
+        edge_ke = max(edge_ke, 1000.0) 
         edge_kd = min(float(sim_config["material"]["garment_edge_kd"]), kd_cap)
         for i in range(len(struct_edges)):
             a, b = struct_edges[i]
@@ -299,8 +300,8 @@ class WarpClothSimulator:
             )
 
         # 添加弯曲弹簧——同样钳制（原配置 ke=5e4/kd=10 会发散）
-        bend_ke = min(float(sim_config["material"]["spring_ke"]), ke_cap) * 0.02
-        bend_kd = min(float(sim_config["material"]["spring_kd"]), kd_cap)
+        bend_ke = min(float(sim_config["material"]["spring_ke"]), ke_cap) * 0.5
+        bend_kd = min(float(sim_config["material"]["spring_kd"]), kd_cap) * 2.0
         for i in range(len(bend_edges)):
             a, b = bend_edges[i]
             builder.add_spring(
@@ -331,7 +332,7 @@ class WarpClothSimulator:
         # 服装贴体间距仅~2cm，若按 25cm 推离会每帧注入巨大能量并与绑定约束对抗。
         # 这里钳制到合理的贴体厚度（约 0.5cm）。
         raw_thickness = sim_config["options"]["body_collision_thickness"]
-        self.collision_thickness = float(min(raw_thickness, 0.01))
+        self.collision_thickness = float(min(raw_thickness, 0.005))
         self.body_friction = sim_config["options"]["body_friction"]
         # mesh 查询半径：需大于碰撞厚度，保证能命中体表最近点
         self.query_dist = float(max(self.collision_thickness * 20.0, 0.1))
@@ -364,22 +365,35 @@ class WarpClothSimulator:
         # 重建加速结构（动态变形必须更新）
         self.body_mesh.refit()
     
+    def update_attachment_body_idx(self, body_verts_np):
+        """动态更新绑定点对应的身体顶点索引（身体变形后重新最近邻搜索）。"""
+        if not self.enable_attachment:
+            return
+        from scipy.spatial import KDTree
+        tree = KDTree(body_verts_np)
+        cloth_pos = self.state_0.particle_q.numpy()
+        new_body_idx = []
+        for ci in self.attach_cloth_idx:
+            _, ni = tree.query(cloth_pos[ci])
+            new_body_idx.append(ni)
+        self.attach_body_idx = np.array(new_body_idx, dtype=np.int32)
+
     def _apply_attachment(self, body_verts_np, dt):
         """应用绑定约束：将绑定点拉向对应人体顶点"""
         if not self.enable_attachment:
             return
-        
+
         # 渐进式增加刚度
         alpha = min(1.0, self.current_frame / self.attach_frames)
         current_stiff = self.attach_stiffness * alpha
-        
+
         # 获取当前绑定目标位置
         strength = float(min(1.0, current_stiff * dt * 0.1))
         if strength <= 0.0:
             return
         target_pos = body_verts_np[self.attach_body_idx].astype(np.float32)
         target_pos_wp = wp.array(target_pos, dtype=wp.vec3, device=self.device)
-        
+
         # 在 kernel 内做位置修正（host 端不支持对 wp.array 逐元素索引）
         wp.launch(
             kernel=attachment_kernel,
@@ -394,44 +408,45 @@ class WarpClothSimulator:
         )
     
     def step(self, body_verts_np, dt=1.0/60.0, gravity_enabled=True):
+        """执行单步仿真（内部子步进，保证显式积分稳定）"""
         self.current_frame += 1
 
-        # 1. 重力开关
+        # 1. 控制重力开关（零重力松弛阶段关闭）
         if not gravity_enabled:
             self.model.gravity = wp.vec3(0.0, 0.0, 0.0)
         else:
             self.model.gravity = wp.vec3(0.0, -9.8, 0.0)
 
+        # 显式积分（SemiImplicit）对刚性弹簧稳定性差，必须把一帧拆成多个子步。
+        # 碰撞与绑定约束按帧施加（帧内人体近似静止），子步只用于积分稳定性。
         sub_dt = dt / self.num_substeps
 
-        # 2. 绑定约束（每帧一次即可，人体姿态不变）
+        # 2. 应用绑定约束（每帧一次）
         self._apply_attachment(body_verts_np, dt)
 
-        # 3. 积分步进 + 定期碰撞修正
-        collision_every = 10  # 每20个子步做一次碰撞，平衡性能与稳定性
-        for sub_step in range(self.num_substeps):
-            # 定期执行碰撞修正
-            if sub_step % collision_every == 0:
-                wp.launch(
-                    kernel=body_collision_kernel,
-                    dim=self.num_cloth_verts,
-                    inputs=[
-                        self.state_0.particle_q,
-                        self.state_0.particle_qd,
-                        self.body_mesh.id,
-                        self.collision_thickness,
-                        self.body_friction,
-                        self.query_dist
-                    ],
-                    device=self.device
-                )
-            
+
+        # 4. 积分步进（子步循环）
+        for _ in range(self.num_substeps):
             self.state_0.clear_forces()
             self.integrator.simulate(self.model, self.state_0, self.state_1, sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+            # 3. 人体网格碰撞（每帧一次）
+            wp.launch(
+                kernel=body_collision_kernel,
+                dim=self.num_cloth_verts,
+                inputs=[
+                    self.state_0.particle_q,
+                    self.state_0.particle_qd,
+                    self.body_mesh.id,
+                    self.collision_thickness,
+                    self.body_friction,
+                    self.query_dist
+                ],
+                device=self.device
+            )
 
-        # 4. 全局阻尼 + 速度钳制
-        damping = max(self.config["options"]["global_damping_factor"], 0.06)
+        # 6. 全局速度阻尼 + 速度钳制（host 端 wp.array 不支持标量乘/索引，转 numpy 处理）
+        damping = self.config["options"]["global_damping_factor"]
         max_vel = self.config["options"]["global_max_velocity"]
         vel_np = self.state_0.particle_qd.numpy()
         if damping > 0:
@@ -441,12 +456,6 @@ class WarpClothSimulator:
         if np.any(mask):
             vel_np[mask] = vel_np[mask] / norms[mask] * max_vel
         self.state_0.particle_qd.assign(wp.array(vel_np, dtype=wp.vec3, device=self.device))
-
-        # NaN 检测
-        pos_np = self.state_0.particle_q.numpy()
-        nan_mask = np.isnan(pos_np).any(axis=1)
-        if np.any(nan_mask):
-            raise RuntimeError(f"仿真发散：检测到 {np.sum(nan_mask)} 个异常顶点，仿真终止")
 
         return self.state_0.particle_q.numpy()
 
@@ -459,7 +468,7 @@ if __name__ == "__main__":
     SMPL_MODEL_PATH = "/root/wyc/code/smpl2garmentcode2/smpl_models"
     GARMENT_OBJ_PATH = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try3/design_sim.obj"
     PRED_SMPL_OBJ_PATH = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try3/pred_smpl.obj"
-    TARGET_POSE_NPZ = "/root/wyc/data/CloSe/data/CloSe-Di/10001_1937.npz"
+    TARGET_POSE_NPZ = "/root/wyc/data/CloSe/data/CloSe-Di/10014_2464.npz"
     SIM_CONFIG_PATH = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/assets/Sim_props/default_sim_props.yaml"
     OUTPUT_DIR = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try3/output"
     PRED_SMPL_JSON_PATH = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try3/smpl.json"
@@ -477,6 +486,8 @@ if __name__ == "__main__":
     # 注意：服装 OBJ 单位为厘米，SMPL 人体单位为米，需统一到米后再仿真
     GARMENT_SCALE = 0.01
     garment_mesh = trimesh.load(GARMENT_OBJ_PATH, process=False)
+    # ========== 合并重合顶点，缝合所有裁片边界 ==========
+    garment_mesh.merge_vertices(merge_tex=True, merge_norm=True)
     garment_verts = np.array(garment_mesh.vertices, dtype=np.float32) * GARMENT_SCALE
     garment_faces = np.array(garment_mesh.faces, dtype=np.int32)
     print(f"服装网格加载完成：{len(garment_verts)} 顶点，{len(garment_faces)} 面 (已缩放到米)")
@@ -490,7 +501,7 @@ if __name__ == "__main__":
     pred_betas = torch.from_numpy(load_betas_from_json(PRED_SMPL_JSON_PATH)).float().unsqueeze(0)
     pred_pose = load_pose_from_json(PRED_SMPL_JSON_PATH)
     base_global_orient = torch.zeros(1, 3)
-    pred_body_pose = torch.from_numpy(pred_pose).float().view(1, 69)
+    base_body_pose = torch.from_numpy(pred_pose).float().view(1, 69)
 
 
     # ---------- 3. 初始化 SMPL 驱动器 ----------
@@ -511,7 +522,7 @@ if __name__ == "__main__":
         model_path=SMPL_MODEL_PATH,
         gender=GENDER,
         base_betas=pred_betas,
-        base_body_pose=pred_body_pose,
+        base_body_pose=base_body_pose,
         base_global_orient=base_global_orient
     )
     print("SMPL 驱动器初始化完成")
@@ -521,14 +532,11 @@ if __name__ == "__main__":
     print(f"SMPL 输出对齐偏移: {offset}")
     
     # ---------- 4. 初始化布料仿真器 ----------
-    base_body_aligned = smpl_driver.base_verts + smpl_driver.align_offset
-    base_body_faces = smpl_driver.faces
-
     sim = WarpClothSimulator(
         garment_verts=garment_verts,
         garment_faces=garment_faces,
-        body_verts=base_body_aligned,  # 统一用SMPL基准人体
-        body_faces=base_body_faces,    # 用SMPL的面拓扑
+        body_verts=pred_body_verts,
+        body_faces=pred_body_faces,
         sim_config=sim_config
     )
     print("布料仿真器初始化完成")
@@ -536,67 +544,104 @@ if __name__ == "__main__":
     # ---------- 5. 阶段一：零重力松弛 ----------
     zero_gravity_steps = sim_config["zero_gravity_steps"]
     print(f"零重力松弛阶段：{zero_gravity_steps} 步")
-    for step in range(20):
-        cloth_verts = sim.step(base_body_aligned, dt=DT, gravity_enabled=False)
+    for step in range(zero_gravity_steps):
+        cloth_verts = sim.step(pred_body_verts, dt=DT, gravity_enabled=False)
 
     # # 保存松弛后结果
     relaxed_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
     relaxed_mesh.export(os.path.join(OUTPUT_DIR, "00_relaxed.obj"))
     
-
-
-
     # ---------- 6. 阶段二：姿态线性过渡 ----------
     transition_frames = 100  # 过渡帧数
     print(f"姿态过渡阶段：{transition_frames} 帧")
+
+    # 将 tensor 转为 numpy 并 reshape 为 (关节数, 3)
+    base_body_np = base_body_pose.numpy().reshape(-1, 3)
+    target_body_np = target_body_pose.numpy().reshape(-1, 3)
+    base_global_np = base_global_orient.numpy().reshape(-1, 3)
+    target_global_np = target_global_orient.numpy().reshape(-1, 3)
+
+    # 转换为 Scipy 的 Rotation 对象
+    rot_base_body = R.from_rotvec(base_body_np)
+    rot_target_body = R.from_rotvec(target_body_np)
+    rot_base_global = R.from_rotvec(base_global_np)
+    rot_target_global = R.from_rotvec(target_global_np)
+
     for frame in range(transition_frames):
         alpha = frame / transition_frames
-        # 姿态线性插值
-        interp_global = base_global_orient * (1-alpha) + target_global_orient * alpha
-        interp_body = pred_body_pose * (1-alpha) + target_body_pose * alpha
-        
-        current_body_verts = smpl_driver.get_body_verts(
+
+        # 使用 Slerp (球面线性插值) 保证人体体积和骨骼不扭曲
+        # 更严谨的 Scipy Slerp 做法 (对每个关节)：
+        interp_body_np = np.zeros_like(base_body_np)
+        for j in range(base_body_np.shape[0]):
+            rots = R.concatenate([rot_base_body[j], rot_target_body[j]])
+            slerp = scipy.spatial.transform.Slerp([0, 1], rots)
+            interp_body_np[j] = slerp([alpha])[0].as_rotvec()
+
+        interp_global_np = np.zeros_like(base_global_np)
+        rots_g = R.concatenate([rot_base_global[0], rot_target_global[0]])
+        slerp_g = scipy.spatial.transform.Slerp([0, 1], rots_g)
+        interp_global_np[0] = slerp_g([alpha])[0].as_rotvec()
+
+        interp_body = torch.from_numpy(interp_body_np).float().view(1, 69)
+        interp_global = torch.from_numpy(interp_global_np).float().view(1, 3)
+
+        # 获取当前插值姿态的人体顶点
+        interp_body_verts = smpl_driver.get_body_verts(
             betas=pred_betas,
             body_pose=interp_body,
             global_orient=interp_global
         )
+        # 更新碰撞体 + 步进仿真
+        sim.update_body_collider(interp_body_verts)
+        # 每 20 帧更新一次绑定点索引，跟踪变形人体
+        # if frame % 20 == 0:
+        #     sim.update_attachment_body_idx(interp_body_verts)
+        cloth_verts = sim.step(interp_body_verts, dt=DT, gravity_enabled=True)
 
-        diff_max = np.max(np.linalg.linalg.norm(current_body_verts - base_body_aligned, axis=1))
-        print(f"与基准人体顶点最大差异: {diff_max:.6f} 米")
-        # 更新碰撞体并步进
-        sim.update_body_collider(current_body_verts)
-        cloth_verts = sim.step(current_body_verts, dt=DT, gravity_enabled=True)
-        
-        # 每隔 10 帧保存
-        if frame % 10 == 0:
+        if frame % 50 == 0:
             mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
             mesh.export(os.path.join(OUTPUT_DIR, f"trans_{frame:04d}.obj"))
+            print(f"Transition {frame}/{transition_frames}, alpha={alpha:.3f}")
+
+    print("姿态过渡完成，保存过渡最终结果")
+    trans_final_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
+    trans_final_mesh.export(os.path.join(OUTPUT_DIR, "01_transition_end.obj"))
+
+
     
     # ---------- 7. 阶段三：正式仿真（目标姿态下动力学） ----------
     max_sim_steps = min(sim_config["max_sim_steps"], 2500)  # 限制步数防止过长
     static_threshold = sim_config["static_threshold"]
     print(f"正式仿真阶段：最多 {max_sim_steps} 步")
-    
+
     target_body_verts = smpl_driver.get_body_verts(
         betas=pred_betas,
         body_pose=target_body_pose,
         global_orient=target_global_orient
     )
-    
+
+    # 在正式仿真开始时更新一次绑定索引
+    sim.update_attachment_body_idx(target_body_verts)
+
     prev_verts = cloth_verts.copy()
     for step in range(max_sim_steps):
         sim.update_body_collider(target_body_verts)
         cloth_verts = sim.step(target_body_verts, dt=DT, gravity_enabled=True)
-        
+
+        # 每 100 帧更新一次绑定点索引
+        if step % 100 == 0 and step > 0:
+            sim.update_attachment_body_idx(target_body_verts)
+
         # 静态收敛检测
         max_displacement = np.max(np.linalg.norm(cloth_verts - prev_verts, axis=1))
         prev_verts = cloth_verts.copy()
-        
-        if step % 10 == 0:
+
+        if step % 100 == 0:
             mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
             mesh.export(os.path.join(OUTPUT_DIR, f"sim_{step:04d}.obj"))
             print(f"Step {step}, max displacement: {max_displacement:.6f}")
-        
+
         # 收敛则提前结束
         if max_displacement < static_threshold and step > 50:
             print(f"仿真在第 {step} 步收敛")

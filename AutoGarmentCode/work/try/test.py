@@ -2,18 +2,26 @@ import torch
 import numpy as np
 import warp as wp
 import smplx
+import trimesh
+import json
 
 # 初始化 Warp 物理引擎
 wp.init()
 
 # ================= 1. LBS 驱动 SMPL 模块 =================
 class SMPLDriver:
-    def __init__(self, model_path, gender='neutral'):
-        self.model = smplx.create(model_path, model_type='smplx', gender=gender, ext='npz')
+    def __init__(self, model_path, gender='female',
+                 base_betas=None,base_body_pose=None,base_global_orient=None):
+        self.model = smplx.create(model_path, model_type='smpl', gender=gender, ext='npz')
         # 提取 T-Pose 下的身体网格，用于 Warp 碰撞体初始化
         with torch.no_grad():
-            output = self.model()
-            self.tpose_verts = output.vertices.squeeze().cpu().numpy()
+            output = self.model(
+                betas=base_betas,
+                body_pose=base_body_pose,
+                global_orient=base_global_orient
+            )
+            self.pose_verts = output.vertices.squeeze().cpu().numpy()
+            self.faces = self.model.faces
             
     def get_body_state(self, betas=None, body_pose=None, global_orient=None):
         """传入姿态参数，返回当前帧的 SMPL 顶点"""
@@ -100,24 +108,135 @@ class WarpGarmentSimulator:
         
         return self.positions.numpy()
 
+def load_smpl_from_obj(obj_path):
+    return trimesh.load(obj_path, process=False)
+
+def load_garment_from_obj(obj_path):
+    return trimesh.load(obj_path, process=False)
+
+def load_betas_from_json(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    if "betas" not in data:
+        raise ValueError(f"Missing 'betas' field in {json_path}")
+
+    betas = np.asarray(data["betas"], dtype=np.float32)
+    if betas.ndim != 1:
+        raise ValueError(f"'betas' must be a 1D array, got shape {betas.shape}")
+
+    return betas
+
+def load_pose_from_json(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    if "pose" not in data:
+        raise ValueError(f"Missing 'pose' field in {json_path}")
+
+    pose = np.asarray(data["pose"], dtype=np.float32)
+    if pose.ndim != 1:
+        raise ValueError(f"'pose' must be a 1D array, got shape {pose.shape}")
+
+    return pose
+
+def load_pose_from_npz(npz_path):
+    data = np.load(npz_path)
+    pose = torch.from_numpy(data["pose"]).float()
+    return pose.view(1, 72)
+
+def load_beta_from_npz(npz_path):
+    data = np.load(npz_path)
+    betas = np.asarray(data["betas"], dtype=np.float32)
+    if betas.ndim != 1:
+        raise ValueError(f"'betas' must be a 1D array, got shape {betas.shape}")
+    return betas
+
+def load_betas_and_pose_from_npz(npz_path):
+    betas = load_beta_from_npz(npz_path)
+    pose = load_pose_from_npz(npz_path)
+    return betas,pose
+
+def export_smpl_mesh(betas, pose, smpl_model_path, output_obj_path):
+    mesh = load_body_form_npz(betas, pose, smpl_model_path)
+    mesh.export(output_obj_path)
+
+def load_body_form_npz(betas, pose, smpl_model_path):
+    smpl_model = smplx.create(model_path=smpl_model_path, model_type="smpl", gender="male")
+
+    betas_tensor = torch.from_numpy(betas).float().unsqueeze(0)
+    body_pose = pose[:, 3:]
+    global_orient = pose[:, :3]
+
+    output = smpl_model(
+        betas=betas_tensor,
+        body_pose=body_pose,
+        global_orient=global_orient,
+    )
+
+    vertices = output.vertices.detach().cpu().numpy()[0]
+    faces = smpl_model.faces
+
+    min_y = vertices[:, 1].min()
+    vertices[:, 1] = vertices[:, 1] - min_y
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+    return mesh
+
 # ================= 3. 主驱动循环 =================
+# if __name__ == "__main__":
+#     # 1. 初始化 SMPL 驱动器 TODO 改为smpl模板，设置模型路径
+#     smpl_driver = SMPLDriver(model_path="~/.smplx/smplx")
+    
+#     # 2. 加载 Garment 模板 (需提前准备好 T-Pose 下的服装网格) TODO 修改为加载obj 服装文件
+#     garment_verts = np.load("garment_tpose_verts.npy") 
+#     garment_faces = np.load("garment_faces.npy")
+    
+#     # 3. 初始化 Warp 服装仿真器 TODO 应用主仿真配置
+#     garment_sim = WarpGarmentSimulator(garment_verts, garment_faces, smpl_driver.tpose_verts)
+    
+#     # 4. 动画循环 TODO 补充目标姿态参数
+#     # 假设传入某个姿态参数
+#     pose_params = torch.zeros() # SMPL-X body pose
+#     current_smpl_verts = smpl_driver.get_body_state(body_pose=pose_params)
+    
+#     # 执行一步物理仿真
+#     new_garment_verts = garment_sim.simulate_step(current_smpl_verts)
+    
+#     print("Garment 顶点更新完成，Shape:", new_garment_verts.shape)
+
 if __name__ == "__main__":
-    # 1. 初始化 SMPL 驱动器 TODO 改为smpl模板，设置模型路径
-    smpl_driver = SMPLDriver(model_path="~/.smplx/smplx")
-    
-    # 2. 加载 Garment 模板 (需提前准备好 T-Pose 下的服装网格) TODO 修改为加载obj 服装文件
-    garment_verts = np.load("garment_tpose_verts.npy") 
-    garment_faces = np.load("garment_faces.npy")
-    
-    # 3. 初始化 Warp 服装仿真器 TODO 应用主仿真配置
-    garment_sim = WarpGarmentSimulator(garment_verts, garment_faces, smpl_driver.tpose_verts)
-    
-    # 4. 动画循环 TODO 补充目标姿态参数
-    # 假设传入某个姿态参数
-    pose_params = torch.zeros() # SMPL-X body pose
-    current_smpl_verts = smpl_driver.get_body_state(body_pose=pose_params)
-    
-    # 执行一步物理仿真
-    new_garment_verts = garment_sim.simulate_step(current_smpl_verts)
-    
-    print("Garment 顶点更新完成，Shape:", new_garment_verts.shape)
+    # # 1.构造pose基础参数
+
+    # base_betas = torch.zeros(10).numpy()
+    # base_body_pose = torch.zeros(1, 69)  # SMPL 身体姿态 69 维
+    # # 示例：A-pose 通常只需调整两个肩关节角度，其余为0
+    # # base_body_pose[0, 16*3 : 17*3] = ...  # 左肩
+    # # base_body_pose[0, 17*3 : 18*3] = ...  # 右肩
+    # base_global_orient = torch.zeros(1, 3)
+
+    # # 2、初始化SMPL驱动器
+    # smpl_driver = SMPLDriver(
+    #     model_path="/root/wyc/code/smpl2garmentcode2/smpl_models",
+    #     gender='neutral',
+    #     base_betas=base_betas,
+    #     base_body_pose=base_body_pose,
+    #     base_global_orient=base_global_orient
+    # )
+    # print("SMPL 驱动器初始化完成，T-Pose 顶点数量:", smpl_driver.pose_verts.shape[0])
+
+    # # load source body mesh
+    source_body_mesh = load_smpl_from_obj("/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try2/pred_smpl.obj")
+
+    # # load garment mesh
+    garment_mesh = load_garment_from_obj("/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try2/design_sim.obj")
+    # garment_mesh.export("garment_Apose.obj")
+
+    # load target body mesh
+
+    betas, pose = load_betas_and_pose_from_npz("/root/wyc/data/CloSe/data/CloSe-Di/10001_1937.npz")
+    betas = load_betas_from_json("/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/try2/smpl.json")
+    target_body_mesh = load_body_form_npz(betas, pose, "/root/wyc/code/smpl2garmentcode2/smpl_models")
+    # target_body_mesh.export("target_body.obj")
+
+

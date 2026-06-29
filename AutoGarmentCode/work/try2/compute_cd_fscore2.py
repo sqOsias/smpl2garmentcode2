@@ -10,7 +10,7 @@ from pathlib import Path
 import open3d as o3d
 DEFAULT_TAU = 0.005  # F-Score阈值，单位米
 NON_GARMENT_LABELS = [0, 1, 10, 12, 13, 14, 15]
-N_SAMPLE = 50000
+N_SAMPLE = 10000  # 采样点数
 def compute_cd_fscore(pred_pts: np.ndarray,
                       gt_pts: np.ndarray,
                       tau: float = DEFAULT_TAU) -> Tuple[float, float]:
@@ -138,6 +138,11 @@ def compute_cd_fscore2() -> Tuple[float, float]:
 
 
     print(f"[Info] Pred shape: {pred_pts.shape}, GT shape: {gt_pts.shape}")
+    # 打印x,y,z轴的坐标进行比较
+    print(f"[Point Cloud Info] Pred - Min: {pred_pts.min(axis=0)}, Max: {pred_pts.max(axis=0)}, Mean: {pred_pts.mean(axis=0)}")
+    print(f"[Point Cloud Info] GT - Min: {gt_pts.min(axis=0)}, Max: {gt_pts.max(axis=0)}, Mean: {gt_pts.mean(axis=0)}")
+    
+
 
     cd, f_score = compute_cd_fscore(pred_pts, gt_pts, DEFAULT_TAU)
     print(f"[Metric] CD={cd:.3f}cm F@{DEFAULT_TAU*1000:.0f}mm={f_score:.4f}")
