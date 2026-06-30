@@ -457,31 +457,81 @@ def get_cd_fscore(pred_pts: np.ndarray, gt_pts: np.ndarray,
 
 
 def save_metrics_to_csv(metrics: dict, output_dir: str, filename: str = "metrics.csv"):
-    """将 CD 和 F-Score 保存到 CSV 文件。
-
-    写入一行：cd_cm, F@5mm, P@5mm, R@5mm, F@10mm, ...
-    """
+    """将 CD 和 F-Score 保存到 CSV 文件。"""
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, filename)
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["cd_cm"] + [f"F-Score@{t}mm" for t in (5,10,20,30,50)])
+        fs = metrics['fscores']
+        writer.writerow([f"{metrics['cd_cm']:.4f}"] + [f"{fs[t]['fscore']:.4f}" for t in (5,10,20,30,50)])
+    print(f"  CD/F-Score saved to {csv_path}")
 
-    # 构建列名和数据行
-    columns = ["cd_cm"]
-    values = [f"{metrics['cd_cm']:.4f}"]
 
-    for tau_mm, fs in sorted(metrics['fscores'].items()):
-        columns += [f"F-Score@{tau_mm}mm", f"Precision@{tau_mm}mm", f"Recall@{tau_mm}mm"]
-        values += [
-            f"{fs['fscore']:.4f}",
-            f"{fs['precision']:.4f}",
-            f"{fs['recall']:.4f}",
-        ]
+def save_metrics(full_metrics: dict, output_dir: str):
+    """保存所有评估参数: 结构合法率、仿真成功率、分类准确率、CD、F-Score。
+
+    写入两个文件:
+      eval_summary.json  — 完整指标 (dict)
+      eval_summary.csv   — 扁平化单行 CSV
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---- JSON ----
+    json_path = os.path.join(output_dir, "eval_summary.json")
+    json_out = {}
+    for k, v in full_metrics.items():
+        if isinstance(v, (float, int, str, type(None))):
+            json_out[k] = v
+        elif isinstance(v, np.ndarray):
+            json_out[k] = v.tolist() if v.size < 100 else f"<ndarray shape={v.shape}>"
+        elif isinstance(v, dict):
+            json_out[k] = {str(kk): (vv if not isinstance(vv, np.ndarray) else f"<ndarray shape={vv.shape}>") for kk, vv in v.items()}
+        else:
+            json_out[k] = str(v)
+    with open(json_path, 'w') as f:
+        json.dump(json_out, f, indent=2)
+    print(f"  Full metrics saved to {json_path}")
+
+    # ---- CSV ----
+    csv_path = os.path.join(output_dir, "eval_summary.csv")
+    columns = [
+        "sample_name",
+        "valid_structure",
+        "sim_success",
+        "class_acc",
+        "upper_correct",
+        "bottom_correct",
+        "connected_correct",
+        "chamfer_distance_cm",
+    ]
+    # 添加多阈值 F-Score
+    thresholds = [5, 10, 20, 30, 50]
+    for t in thresholds:
+        columns += [f"F-Score@{t}mm", f"Precision@{t}mm", f"Recall@{t}mm"]
 
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(columns)
-        writer.writerow(values)
-
-    print(f"\n  Metrics saved to {csv_path}")
+        row = [
+            full_metrics.get('sample_name', ''),
+            f"{full_metrics.get('valid_structure', 0):.4f}",
+            f"{full_metrics.get('sim_success', 0):.4f}",
+            f"{full_metrics.get('class_acc', 0):.4f}",
+            f"{full_metrics.get('upper_correct', 0):.4f}",
+            f"{full_metrics.get('bottom_correct', 0):.4f}",
+            f"{full_metrics.get('connected_correct', 0):.4f}",
+            f"{full_metrics.get('chamfer_distance', 0):.4f}" if full_metrics.get('chamfer_distance') is not None else "",
+        ]
+        for t in thresholds:
+            fs = full_metrics.get('fscores', {}).get(t, {})
+            row += [
+                f"{fs.get('fscore', 0):.4f}" if fs else "",
+                f"{fs.get('precision', 0):.4f}" if fs else "",
+                f"{fs.get('recall', 0):.4f}" if fs else "",
+            ]
+        writer.writerow(row)
+    print(f"  Summary CSV saved to {csv_path}")
 
 
 def export_results(pred_mesh: trimesh.Trimesh,
@@ -628,9 +678,13 @@ def evaluate_single_sample(args) -> Dict:
                                   npz_path,
                                   driven_garment_obj,
                                   gender,
-                                  output_dir) 
+                                  output_dir)
     metrics['chamfer_distance'] = cd_fscore['cd_cm']
-    metrics['f_score'] = cd_fscore['fscores'][10]['fscore'] 
+    metrics['f_score'] = cd_fscore['fscores'][10]['fscore']
+    metrics['fscores'] = cd_fscore['fscores']
+
+    # ---- 5. 保存所有指标 ----
+    save_metrics(metrics, output_dir)
 
     return metrics
 

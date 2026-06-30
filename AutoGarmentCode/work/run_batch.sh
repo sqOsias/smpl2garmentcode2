@@ -1,19 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-# =============================================================================
-# 批量图片端到端服装生成脚本
-# 遍历图片目录，逐个调用单样本 run.sh 执行全流程，自动跳过渲染阶段
-#
-# 用法:
-#   bash work/run_batch.sh [IMG_FOLDER] [OUT_FOLDER] [SIM]
-#       IMG_FOLDER  输入图片目录（默认 ./assets/test_img/ubc_2）
-#       OUT_FOLDER  输出根目录（默认 ./output_batch）
-#       SIM         是否跑物理仿真 sim|false（默认 sim）
-#
-# 支持所有单样本的 DO_* 阶段开关，例如只跑人体估计：
-#   DO_AGENT=0 DO_GARMENT=0 bash work/run_batch.sh
-# =============================================================================
+set -euo pipefai
 
 # ---- 参数解析 ----
 IMG_FOLDER="${1:-/root/wyc/code/smpl2garment/data}"
