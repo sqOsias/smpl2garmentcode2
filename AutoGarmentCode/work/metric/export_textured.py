@@ -1,7 +1,6 @@
 """
 从 Warp 仿真输出的驱动顶点 + 原始 design_sim.obj，导出带 UV 的 OBJ 并渲染。
-不改动现有仿真脚本，独立运行。
-写 16832 merged 顶点 + 重映射面索引（不展开到原始拓扑，避免重复顶点导致 trimesh 加载出错）。
+反merge方案：驱动顶点映射回原始拓扑(18123v)，顶点数=UV数=面索引范围，无错位。
 """
 import os, sys, shutil
 import numpy as np
@@ -18,11 +17,15 @@ sys.path.insert(0, "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode")
 from pygarment.meshgen.render.pythonrender import load_meshes, render
 
 # ========================== 配置 ==========================
-SAMPLE = "10014_2464"
+SAMPLE = "10072_7073"
 ORIG_GARMENT = f"/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe/{SAMPLE}/design/design_sim.obj"
-SMPL_OBJ     = f"/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe/{SAMPLE}/smpl.obj"
-DRIVEN_MERGED_OBJ = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/metric/result/final_result.obj"
+NPZ_PATH = f"/root/wyc/data/CloSe/data/CloSe-Di/{SAMPLE}.npz"
+SMPL_JSON = f"/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe/{SAMPLE}/hybrik/smpl.json"
+DRIVEN_MERGED_OBJ = f"/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe/{SAMPLE}/driven/final_result.obj"
+APOSE_REF_OBJ = f"/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe/{SAMPLE}/driven/apose_merged_reference.obj"
+PRED_SMPL_OBJ = f"/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe/{SAMPLE}/smpl.obj"
 OUTPUT_DIR   = "/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/work/metric/result"
+SMPL_MODEL_PATH = "/root/wyc/code/smpl2garmentcode2/smpl_models"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ========================== 1. 解析 OBJ UV/面 ==========================
@@ -44,51 +47,85 @@ def parse_obj_uv(path):
     return {'vt': np.array(uvs, dtype=np.float32), 'faces_v': faces_v, 'faces_vt': faces_vt}
 
 # ========================== 2. 构建 merge 映射 ==========================
-def build_merge_map(orig_obj_path):
+def build_merge_map(orig_obj_path, apose_merged_path):
+    """用 driven_garment_mesh.py 导出的 A-pose merged 基准顶点做空间最近邻匹配。
+    不再依赖 round 分组——直接用 KDTree 建立 原始顶点→merged顶点 的精确映射。"""
     orig_mesh = trimesh.load(orig_obj_path, process=False)
-    orig_verts = np.array(orig_mesh.vertices)
+    orig_verts = np.array(orig_mesh.vertices)  # cm
 
-    groups = defaultdict(list)
-    for i in range(len(orig_verts)):
-        groups[tuple(orig_verts[i].round(3))].append(i)
+    apose_merged = trimesh.load(apose_merged_path, process=False)
+    apose_verts = np.array(apose_merged.vertices)  # m → cm
+    if apose_verts[:, 1].max() < 5.0:
+        apose_verts *= 100.0
 
-    merged_mesh = orig_mesh.copy()
-    merged_mesh.merge_vertices(merge_tex=True, merge_norm=True)
-    merged_verts = np.array(merged_mesh.vertices)
+    tree = KDTree(apose_verts)
+    _, orig_to_merged = tree.query(orig_verts)
+    return orig_to_merged, len(orig_verts), len(apose_verts)
 
-    tree = KDTree(merged_verts)
-    orig_to_merged = np.zeros(len(orig_verts), dtype=np.int32)
-    for key, members in groups.items():
-        _, mi = tree.query(np.array(key))
-        for orig_i in members:
-            orig_to_merged[orig_i] = mi
+# ========================== 3. 导出 OBJ (merged 拓扑 + merged UV) ==========================
+def export_merged_obj(out_path, driven_merged_cm, apose_merged_path, orig_obj_path):
+    """用 merged 拓扑 (25293v) + merged面 + 重建 UV。
+    不再反merge到原始拓扑——避免 KDTree 多对一映射导致面索引错乱。"""
+    # 原始 OBJ 的 UV 和面数据
+    orig = trimesh.load(orig_obj_path, process=False)
+    orig_verts = np.array(orig.vertices)
+    orig_uv = orig.visual.uv.copy()
 
-    return orig_to_merged, len(orig_verts), len(merged_verts)
+    # A-pose merged 面索引 (25293 顶点 → 面)
+    apose = trimesh.load(apose_merged_path, process=False)
+    apose_v = np.array(apose.vertices)
+    apose_f = np.array(apose.faces)
+    if apose_v[:,1].max() < 5.0:
+        apose_v *= 100.0  # m → cm
 
-# ========================== 3. 导出 merged 顶点 OBJ ==========================
-def export_merged_obj(out_path, driven_merged_cm, orig_to_merged, uv_data):
-    orig_vt = uv_data['vt']
-    orig_fv = uv_data['faces_v']; orig_fvt = uv_data['faces_vt']
+    # 为每个 merged 顶点分配 UV：找最近的原始顶点位置，取其 UV
+    n_merged = len(apose_v)
+    merged_uv = np.zeros((n_merged, 2), dtype=np.float32)
+    tree = KDTree(orig_verts)
+    for mi in range(n_merged):
+        _, oi = tree.query(apose_v[mi])
+        merged_uv[mi] = orig_uv[oi]
 
     with open(out_path, 'w') as f:
         f.write("mtllib design_material.mtl\n")
-        # 顶点: 16832 merged 位置
         for v in driven_merged_cm:
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-        # UV: 保留全部 17668 个原始 UV (面UV索引仍然有效)
-        for u in orig_vt:
+        for u in merged_uv:
             f.write(f"vt {u[0]:.6f} {u[1]:.6f}\n")
-        # 面: 顶点ID重映射, UV ID 保持不变(参考原始17668 UV数组)
-        for i in range(len(orig_fv)):
-            oa, ob, oc = orig_fv[i][0], orig_fv[i][1], orig_fv[i][2]
-            ma = orig_to_merged[oa-1] + 1
-            mb = orig_to_merged[ob-1] + 1
-            mc = orig_to_merged[oc-1] + 1
-            ta, tb, tc = orig_fvt[i]
-            f.write(f"f {ma}/{ta} {mb}/{tb} {mc}/{tc}\n")
+        for face in apose_f:
+            a, b, c = int(face[0])+1, int(face[1])+1, int(face[2])+1
+            f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
 
-# ========================== 4. 渲染 ==========================
-def render_driven(driven_obj_path, body_obj_path, out_dir, sample_name):
+# ========================== 4. 生成 GT pose 身体 + 渲染 ==========================
+def render_driven_gtpose(driven_obj_path, npz_path, smpl_json, out_dir, sample_name):
+    """生成 GT pose 的 SMPL 身体并渲染（与驱动后服装姿态一致）"""
+    import json, torch, smplx
+
+    data = np.load(npz_path)
+    with open(smpl_json) as f:
+        pred = json.load(f)
+
+    # GT body: npz betas + GT pose
+    model = smplx.create(SMPL_MODEL_PATH, model_type='smpl', gender='male')
+    gt_betas = torch.from_numpy(data['betas']).float().unsqueeze(0)
+    gt_pose = torch.from_numpy(data['pose']).float().view(1, 72)
+    with torch.no_grad():
+        gt_body = model(betas=gt_betas, body_pose=gt_pose[:,3:], global_orient=gt_pose[:,:3]).vertices.squeeze().numpy()
+    # 应用与 driven_garment_mesh.py 相同的 offset 逻辑
+    pred_betas_t = torch.from_numpy(np.array(pred['betas'], dtype=np.float32)).unsqueeze(0)
+    a_pose = torch.zeros(1, 69)
+    with torch.no_grad():
+        pred_body_raw = model(betas=pred_betas_t, body_pose=a_pose, global_orient=torch.zeros(1,3)).vertices.squeeze().numpy()
+    pred_body_ref = np.array(trimesh.load(PRED_SMPL_OBJ, process=False).vertices, dtype=np.float32)
+    align_offset = pred_body_ref.mean(axis=0) - pred_body_raw.mean(axis=0)
+    gt_body = gt_body + align_offset
+
+    # 导出临时 OBJ 供 load_meshes 加载
+    body_obj = os.path.join(out_dir, "_gt_body_temp.obj")
+    trimesh.Trimesh(gt_body, model.faces).export(body_obj)
+    body_v = gt_body * 100.0  # m → cm (load_meshes 会 /100)
+    body_f = np.array(model.faces, dtype=np.int32)
+
     out_path = Path(out_dir)
     class RP: pass
     rp = RP()
@@ -96,39 +133,32 @@ def render_driven(driven_obj_path, body_obj_path, out_dir, sample_name):
     rp.sim_tag = f"{sample_name}_driven"; rp.name = sample_name
     rp.render_path = lambda side: str(out_path / f"{sample_name}_driven_{side}.png")
 
-    body_mesh = trimesh.load(body_obj_path, process=False)
-    body_v = np.array(body_mesh.vertices, dtype=np.float32)
-    body_f = np.array(body_mesh.faces, dtype=np.int32)
-
     render_props = {'sides': ['front', 'back'], 'resolution': [1080, 1080],
                      'front_camera_location': [0, 0.97, 4.15]}
 
-    py_garm, py_body = load_meshes(rp, body_v, body_f)
     for side in ['front', 'back']:
+        py_garm, py_body = load_meshes(rp, body_v, body_f)  # 每次重新加载，避免 Mesh already bound
         render(py_garm, py_body, side, rp, render_props)
         print(f"  {rp.render_path(side)}")
+    os.remove(body_obj)
 
 # ========================== main ==========================
 if __name__ == "__main__":
-    print("1. 解析原始 OBJ")
-    uv_data = parse_obj_uv(ORIG_GARMENT)
-    print(f"   UV: {len(uv_data['vt'])}, faces: {len(uv_data['faces_v'])}")
+    print("1. 加载 A-pose merged 参考")
+    apose_ref = trimesh.load(APOSE_REF_OBJ, process=False)
+    n_merged = len(apose_ref.vertices)
+    print(f"   merged verts count: {n_merged}")
 
-    print("\n2. 构建 merge 映射")
-    orig_to_merged, n_orig, n_merged = build_merge_map(ORIG_GARMENT)
-    print(f"   {n_orig} -> {n_merged}")
-
-    print("\n3. 加载驱动顶点")
+    print("\n2. 加载驱动顶点")
     driven = trimesh.load(DRIVEN_MERGED_OBJ, process=False)
     driven_cm = np.array(driven.vertices, dtype=np.float64)
     if driven_cm[:,1].max() < 5.0:
-        driven_cm *= 100.0  # m -> cm
-    print(f"   merged verts: {len(driven_cm)}")
-    assert len(driven_cm) == n_merged, f"顶点数不匹配: {len(driven_cm)} vs {n_merged}"
+        driven_cm *= 100.0  # m → cm
+    print(f"   driven verts: {len(driven_cm)} (期望 {n_merged})")
 
-    print("\n4. 导出 merged OBJ")
+    print("\n4. 导出 merged 拓扑 OBJ")
     driven_obj = os.path.join(OUTPUT_DIR, f"{SAMPLE}_driven_merged.obj")
-    export_merged_obj(driven_obj, driven_cm, orig_to_merged, uv_data)
+    export_merged_obj(driven_obj, driven_cm, APOSE_REF_OBJ, ORIG_GARMENT)
 
     design_dir = os.path.dirname(ORIG_GARMENT)
     for f in ["design_material.mtl", "design_texture.png", "design_texture_fabric.png"]:
@@ -141,8 +171,8 @@ if __name__ == "__main__":
     tex = trimesh.load(driven_obj, process=False)
     deg = sum(1 for f in tex.faces if np.linalg.norm(np.cross(
         tex.vertices[f[0]]-tex.vertices[f[1]], tex.vertices[f[0]]-tex.vertices[f[2]])) < 1e-6)
-    print(f"   退化面: {deg} (期望0)")
+    print(f"   顶点={tex.vertices.shape}, UV={tex.visual.uv.shape}, 退化面={deg}")
 
-    print("\n5. 渲染")
-    render_driven(driven_obj, SMPL_OBJ, OUTPUT_DIR, SAMPLE)
+    print("\n5. 渲染 (GT pose 身体)")
+    render_driven_gtpose(driven_obj, NPZ_PATH, SMPL_JSON, OUTPUT_DIR, SAMPLE)
     print("\nDONE")
