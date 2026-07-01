@@ -15,9 +15,7 @@ sample,gender
 10020_2805,male
 10023_3019,male
 10027_3259,female
-10027_3259,female
-10027_3259,female
-100027_3297,female
+10027_3297,female
 10027_3307,female
 10030_3494,female
 10031_3535,male
@@ -40,7 +38,7 @@ sample,gender
 10072_7073,male
 10072_7095,male
 10073_7169,male
-10074_7477,female
+10076_7477,female
 10076_7483,female
 10088_8029,female
 10089_8136,male
@@ -49,3 +47,5 @@ sample,gender
 10095_8424,male
 10099_8875,female
 10100_8942,female
+10102_9107,female
+10112_9583,male

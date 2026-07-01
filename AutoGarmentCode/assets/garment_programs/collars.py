@@ -95,85 +95,28 @@ class NoPanelsCollar(pyg.Component):
         super().__init__(name)
 
         # Front
-        collar_type_name = design['collar']['f_collar']['v']
-        collar_type = globals()[collar_type_name]
-        
-        # 检查是否为函数（简单形状函数）而不是类
-        import inspect
-        if inspect.isclass(collar_type):
-            # 如果是类，则无法作为简单形状函数使用，使用默认的CircleNeckHalf
-            print(f"警告: {collar_type_name} 是一个类而不是函数，使用默认的CircleNeckHalf代替")
-            collar_type = CircleNeckHalf
-            f_collar = collar_type(
-                design['collar']['fc_depth']['v'],
-                design['collar']['width']['v']
-            )
-        else:
-            # 获取函数的签名以确定它可以接受哪些参数
-            sig = inspect.signature(collar_type)
-            params = set(sig.parameters.keys())
-            
-            # 构建参数字典，只包含函数支持的参数
-            f_collar_kwargs = {}
-            
-            # 总是添加必需的参数（假设所有衣领类型都需要depth和width）
-            f_collar_kwargs['depth'] = design['collar']['fc_depth']['v']
-            f_collar_kwargs['width'] = design['collar']['width']['v']
-            
-            # 添加可选参数，但仅当函数支持时
-            optional_params = {
-                'angle': design['collar']['fc_angle']['v'],
-                'flip': design['collar']['f_flip_curve']['v'],
-                'x': design['collar']['f_bezier_x']['v'],
-                'y': design['collar']['f_bezier_y']['v'],
-                'verbose': self.verbose
-            }
-            
-            for param_name, param_value in optional_params.items():
-                if param_name in params:
-                    f_collar_kwargs[param_name] = param_value
-            
-            f_collar = collar_type(**f_collar_kwargs)
+        collar_type = globals()[design['collar']['f_collar']['v']]
+        f_collar = collar_type(
+            design['collar']['fc_depth']['v'],
+            design['collar']['width']['v'], 
+            angle=design['collar']['fc_angle']['v'], 
+            flip=design['collar']['f_flip_curve']['v'],
+            x=design['collar']['f_bezier_x']['v'],
+            y=design['collar']['f_bezier_y']['v'],
+            verbose=self.verbose
+        )
 
         # Back
-        collar_type_name = design['collar']['b_collar']['v']
-        collar_type = globals()[collar_type_name]
-        
-        # 检查是否为函数（简单形状函数）而不是类
-        if inspect.isclass(collar_type):
-            # 如果是类，则无法作为简单形状函数使用，使用默认的CircleNeckHalf
-            print(f"警告: {collar_type_name} 是一个类而不是函数，使用默认的CircleNeckHalf代替")
-            collar_type = CircleNeckHalf
-            b_collar = collar_type(
-                design['collar']['bc_depth']['v'],
-                design['collar']['width']['v']
-            )
-        else:
-            # 获取函数的签名以确定它可以接受哪些参数
-            sig = inspect.signature(collar_type)
-            params = set(sig.parameters.keys())
-            
-            # 构建参数字典，只包含函数支持的参数
-            b_collar_kwargs = {}
-            
-            # 总是添加必需的参数（假设所有衣领类型都需要depth和width）
-            b_collar_kwargs['depth'] = design['collar']['bc_depth']['v']
-            b_collar_kwargs['width'] = design['collar']['width']['v']
-            
-            # 添加可选参数，但仅当函数支持时
-            optional_params = {
-                'angle': design['collar']['bc_angle']['v'],
-                'flip': design['collar']['b_flip_curve']['v'],
-                'x': design['collar']['b_bezier_x']['v'],
-                'y': design['collar']['b_bezier_y']['v'],
-                'verbose': self.verbose
-            }
-            
-            for param_name, param_value in optional_params.items():
-                if param_name in params:
-                    b_collar_kwargs[param_name] = param_value
-            
-            b_collar = collar_type(**b_collar_kwargs)
+        collar_type = globals()[design['collar']['b_collar']['v']]
+        b_collar = collar_type(
+            design['collar']['bc_depth']['v'], 
+            design['collar']['width']['v'], 
+            angle=design['collar']['bc_angle']['v'],
+            flip=design['collar']['b_flip_curve']['v'],
+            x=design['collar']['b_bezier_x']['v'],
+            y=design['collar']['b_bezier_y']['v'],
+            verbose=self.verbose
+        )
         
         self.interfaces = {
             'front_proj': pyg.Interface(self, f_collar),
@@ -424,4 +367,3 @@ class Hood2Panels(pyg.Component):
 
     def length(self):
         return self.panel.length()
-

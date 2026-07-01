@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SAMPLE="${1:-10014_2464}"
-GENDER="${GENDER:-female}"
 SIM="${2:-sim}"
+GENDER="${3:-${GENDER:-female}}"
 
 # ---- 阶段开关 ----
 DO_RENDER="${DO_RENDER:-0}"
@@ -102,11 +102,16 @@ fi
 
 # ---- 6. GarmentCode 生成样板 + (可选) 仿真 ----
 if [ "$DO_GARMENT" = "1" ]; then
-  echo "[6/7] generating pattern with GarmentCode (sim=$SIM) ..."
+  echo "[6/7] generating pattern with GarmentCode (sim=$SIM) ...  [$(date '+%H:%M:%S')]"
+  _sim_start=$(date +%s)
   ( cd "$PROJECT_ROOT" && $CONDA garmentcode python "$PROJECT_ROOT/work/garmentcode.py" \
         --design_path "$OUTPUT_DIR/design.yaml" \
         --body_path "$OUTPUT_DIR/smpl.yaml" \
         --sim "$SIM" )
+  _sim_elapsed=$(( $(date +%s) - _sim_start ))
+  echo "      sim time: ${_sim_elapsed}s ($(( _sim_elapsed / 60 ))m $(( _sim_elapsed % 60 ))s)"
+  # 写入单独的仿真耗时日志
+  echo "$SAMPLE,$_sim_elapsed" >> "$PROJECT_ROOT/output/CloSe/sim_timing.csv"
 else
   echo "[6/7] skipping GarmentCode"
 fi

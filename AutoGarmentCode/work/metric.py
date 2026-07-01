@@ -584,8 +584,11 @@ def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str,gender:str
     # 3. Kabsch 躯干对齐 (Pred body → GT body)
     R_body, t_body = body_kabsch_align(gt_body, pred_body)
 
-    # 4. 加载服装 + 应用 Kabsch 变换
+    # 4. 加载服装 + 撤销Y偏移 + 应用 Kabsch 变换
     garment_v, garment_f = load_garment(garment_obj)
+    # 撤销 export_smpl_mesh.py 的 Y 偏移：服装在 shifted 坐标系(Y≈[0,1.8])，
+    # 需转回 SMPL 原生坐标系(Y≈[-1.3,0.6])才能正确应用身体 Kabsch 变换
+    garment_v[:, 1] += pred_body[:, 1].min()
     garment_v = apply_rigid_transform(garment_v, R_body, t_body)
 
     # 5. 构建 GT 服装网格

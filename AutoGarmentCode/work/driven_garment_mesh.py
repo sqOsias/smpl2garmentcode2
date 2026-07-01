@@ -138,6 +138,34 @@ def find_attachment_points(garment_verts, body_verts, attachment_labels=None):
     
     return np.array(attachment_idx, dtype=np.int32), np.array(attachment_body_idx, dtype=np.int32)
 
+# def find_attachment_points(garment_verts, body_verts):
+#     attachment_idx = []
+#     attachment_body_idx = []
+    
+#     threshold = 0.015  # 收紧距离阈值，只找极其贴身的点（1.5厘米）
+    
+#     # 找到人体的最高点（头顶）
+#     body_max_y = body_verts[:, 1].max()
+#     # 定义“安全绑躯干区”：从头顶往下 35 厘米以内（主要是脖子、肩膀、胸部）
+#     safe_y_min = body_max_y - 0.35 
+
+#     for i, gv in enumerate(garment_verts):
+#         # 优化1：只允许肩膀和胸部以上的衣服点成为图钉！
+#         # 避免袖口、裙摆被错误地绑定到腿上或腰上
+#         if gv[1] < safe_y_min:
+#             continue
+            
+#         dists = np.linalg.norm(body_verts - gv, axis=1)
+#         min_idx = np.argmin(dists)
+#         min_dist = dists[min_idx]
+        
+#         # 优化2：只有衣服离得很近才绑
+#         if min_dist < threshold:
+#             attachment_idx.append(i)
+#             attachment_body_idx.append(min_idx)
+    
+#     return np.array(attachment_idx), np.array(attachment_body_idx)
+
 # ======================================
 # 2. SMPL 人体驱动模块
 # ======================================
@@ -422,13 +450,13 @@ class WarpClothSimulator:
         # 碰撞与绑定约束按帧施加（帧内人体近似静止），子步只用于积分稳定性。
         sub_dt = dt / self.num_substeps
 
-        # 2. 应用绑定约束（每帧一次）
-        self._apply_attachment(body_verts_np, dt)
 
 
         # 4. 积分步进（子步循环）
         for _ in range(self.num_substeps):
             self.state_0.clear_forces()
+            # 2. 应用绑定约束（每帧一次）
+            self._apply_attachment(body_verts_np, sub_dt)
             self.integrator.simulate(self.model, self.state_0, self.state_1, sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             # 3. 人体网格碰撞（每帧一次）

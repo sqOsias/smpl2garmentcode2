@@ -16,8 +16,8 @@ set -euo pipefail
 # 依赖 conda 环境: nvidiawarp
 # =============================================================================
 
-SAMPLE="${1:-10030_3499}"
-GENDER="${2:-female}"
+SAMPLE="${1:-10043_4613}"
+GENDER="${2:-male}"
 
 DO_DRIVE="${DO_DRIVE:-1}"
 DO_METRIC="${DO_METRIC:-1}"
