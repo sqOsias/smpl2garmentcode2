@@ -648,11 +648,17 @@ if __name__ == "__main__":
                         default='/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe')
     parser.add_argument('--sample', type=str, default="10010_2314",
                         help='sample evaluation, pass sample name like 10010_2314')
-    parser.add_argument('--gender', type=str)
+    parser.add_argument('--gender', type=str, default='male')
+    parser.add_argument('--driven_dir', type=str, default=None,
+                        help='driven garment output dir (default: output_root/sample/driven)')
     args = parser.parse_args()
 
+    # driven garment 默认路径
+    if args.driven_dir is None:
+        args.driven_dir = os.path.join(args.output_root, args.sample, 'driven')
 
     metrics = evaluate_single_sample(args)
     print(f"\n{'='*50}\nSample: {args.sample}\n{'='*50}")
     for k, v in metrics.items():
-        print(f"{k}: {v}")
+        if not isinstance(v, np.ndarray):
+            print(f"  {k}: {v}")

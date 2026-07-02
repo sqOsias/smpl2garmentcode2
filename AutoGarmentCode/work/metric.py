@@ -353,6 +353,7 @@ def build_gt_garment_mesh(data: dict, non_garment_labels: Tuple[int, ...]) -> tr
     # 服装顶点 → metric 坐标
     gar_mask = ~np.isin(labels, non_garment_labels)
     gar_pts = points[gar_mask] / scale - trans.reshape(1, 3)
+    # gar_pts = points[gar_mask]
 
     # 服装面片（三个顶点都是服装标签）
     gar_indices = np.where(gar_mask)[0]
@@ -606,6 +607,9 @@ def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str,gender:str
     pred_pts, _ = trimesh.sample.sample_surface(pred_mesh, N_SAMPLE)
     gt_pts, _ = trimesh.sample.sample_surface(gt_mesh, N_SAMPLE)
 
+    print(f"\n  Pred garment Y=[{pred_pts[:, 1].min():.3f}, {pred_pts[:, 1].max():.3f}]")
+    print(f"  GT garment Y=[{gt_pts[:, 1].min():.3f}, {gt_pts[:, 1].max():.3f}]")
+
     metrics = get_cd_fscore(pred_pts, gt_pts)
     save_metrics_to_csv(metrics, output_dir)
     export_results(pred_mesh, pred_pts, gt_pts, output_dir)
@@ -704,9 +708,9 @@ if __name__ == "__main__":
                         default='/root/wyc/data/CloSe/data/CloSe-Di')
     parser.add_argument('--output_root', type=str,
                         default='/root/wyc/code/smpl2garmentcode2/AutoGarmentCode/output/CloSe')
-    parser.add_argument('--sample', type=str, default="10001_1956",
+    parser.add_argument('--sample', type=str, default="10027_3297",
                         help='sample evaluation, pass sample name like 10010_2314')
-    parser.add_argument('--gender', type=str,default="male")
+    parser.add_argument('--gender', type=str,default="female")
     args = parser.parse_args()
 
 

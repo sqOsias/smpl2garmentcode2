@@ -119,52 +119,52 @@ def compute_particle_masses(verts, faces, density):
     
     return masses
 
-def find_attachment_points(garment_verts, body_verts, attachment_labels=None):
-    """
-    简单实现：找到服装顶点中距离人体最近的一批顶点作为绑定点
-    实际工程中应根据标签（领口、下摆等）分组匹配
-    """
-    attachment_idx = []
-    attachment_body_idx = []
-    
-    # 简化：取距离人体小于阈值的顶点作为绑定点
-    threshold = 0.02
-    for i, gv in enumerate(garment_verts):
-        dists = np.linalg.norm(body_verts - gv, axis=1)
-        min_dist = dists.min()
-        if min_dist < threshold:
-            attachment_idx.append(i)
-            attachment_body_idx.append(np.argmin(dists))
-    
-    return np.array(attachment_idx, dtype=np.int32), np.array(attachment_body_idx, dtype=np.int32)
-
-# def find_attachment_points(garment_verts, body_verts):
+# def find_attachment_points(garment_verts, body_verts, attachment_labels=None):
+#     """
+#     简单实现：找到服装顶点中距离人体最近的一批顶点作为绑定点
+#     实际工程中应根据标签（领口、下摆等）分组匹配
+#     """
 #     attachment_idx = []
 #     attachment_body_idx = []
     
-#     threshold = 0.015  # 收紧距离阈值，只找极其贴身的点（1.5厘米）
-    
-#     # 找到人体的最高点（头顶）
-#     body_max_y = body_verts[:, 1].max()
-#     # 定义“安全绑躯干区”：从头顶往下 35 厘米以内（主要是脖子、肩膀、胸部）
-#     safe_y_min = body_max_y - 0.35 
-
+#     # 简化：取距离人体小于阈值的顶点作为绑定点
+#     threshold = 0.02
 #     for i, gv in enumerate(garment_verts):
-#         # 优化1：只允许肩膀和胸部以上的衣服点成为图钉！
-#         # 避免袖口、裙摆被错误地绑定到腿上或腰上
-#         if gv[1] < safe_y_min:
-#             continue
-            
 #         dists = np.linalg.norm(body_verts - gv, axis=1)
-#         min_idx = np.argmin(dists)
-#         min_dist = dists[min_idx]
-        
-#         # 优化2：只有衣服离得很近才绑
+#         min_dist = dists.min()
 #         if min_dist < threshold:
 #             attachment_idx.append(i)
-#             attachment_body_idx.append(min_idx)
+#             attachment_body_idx.append(np.argmin(dists))
     
-#     return np.array(attachment_idx), np.array(attachment_body_idx)
+#     return np.array(attachment_idx, dtype=np.int32), np.array(attachment_body_idx, dtype=np.int32)
+
+def find_attachment_points(garment_verts, body_verts):
+    attachment_idx = []
+    attachment_body_idx = []
+    
+    threshold = 0.015  # 收紧距离阈值，只找极其贴身的点（1.5厘米）
+    
+    # 找到人体的最高点（头顶）
+    body_max_y = body_verts[:, 1].max()
+    # 定义“安全绑躯干区”：从头顶往下 35 厘米以内（主要是脖子、肩膀、胸部）
+    safe_y_min = body_max_y - 0.35 
+
+    for i, gv in enumerate(garment_verts):
+        # 优化1：只允许肩膀和胸部以上的衣服点成为图钉！
+        # 避免袖口、裙摆被错误地绑定到腿上或腰上
+        if gv[1] < safe_y_min:
+            continue
+            
+        dists = np.linalg.norm(body_verts - gv, axis=1)
+        min_idx = np.argmin(dists)
+        min_dist = dists[min_idx]
+        
+        # 优化2：只有衣服离得很近才绑
+        if min_dist < threshold:
+            attachment_idx.append(i)
+            attachment_body_idx.append(min_idx)
+    
+    return np.array(attachment_idx), np.array(attachment_body_idx)
 
 # ======================================
 # 2. SMPL 人体驱动模块
@@ -531,6 +531,10 @@ if __name__ == "__main__":
     garment_verts = np.array(garment_mesh.vertices, dtype=np.float32) * GARMENT_SCALE
     garment_faces = np.array(garment_mesh.faces, dtype=np.int32)
     print(f"load garment mesh:{len(garment_verts)} vertics,{len(garment_faces)} faces")
+    # 导出 A-pose merged 基准 OBJ (供 export_textured.py 做反merge映射)
+    apose_ref = trimesh.Trimesh(vertices=garment_verts, faces=garment_faces, process=False)
+    apose_ref.export(os.path.join(OUTPUT_DIR, "apose_merged_reference.obj"))
+    print(f"export apose merged reference -> {OUTPUT_DIR}/apose_merged_reference.obj")
     
     # 加载基准人体（A-pose）
     pred_body_mesh = trimesh.load(PRED_SMPL_OBJ_PATH, process=False)
@@ -588,7 +592,7 @@ if __name__ == "__main__":
         cloth_verts = sim.step(pred_body_verts, dt=DT, gravity_enabled=False)
 
     # # 保存松弛后结果
-    relaxed_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
+    relaxed_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces, process=False)
     relaxed_mesh.export(os.path.join(OUTPUT_DIR, "00_relaxed.obj"))
     
     # ---------- 6. 阶段二：姿态线性过渡 ----------
@@ -640,12 +644,12 @@ if __name__ == "__main__":
         cloth_verts = sim.step(interp_body_verts, dt=DT, gravity_enabled=True)
 
         if frame % 50 == 0:
-            mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
+            mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces, process=False)
             mesh.export(os.path.join(OUTPUT_DIR, f"trans_{frame:04d}.obj"))
             print(f"Transition {frame}/{transition_frames}, alpha={alpha:.3f}")
 
     print("姿态过渡完成，保存过渡最终结果")
-    trans_final_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
+    trans_final_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces, process=False)
     trans_final_mesh.export(os.path.join(OUTPUT_DIR, "01_transition_end.obj"))
 
 
@@ -678,7 +682,7 @@ if __name__ == "__main__":
         prev_verts = cloth_verts.copy()
 
         if step % 100 == 0:
-            mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
+            mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces, process=False)
             mesh.export(os.path.join(OUTPUT_DIR, f"sim_{step:04d}.obj"))
             print(f"Step {step}, max displacement: {max_displacement:.6f}")
 
@@ -688,6 +692,6 @@ if __name__ == "__main__":
             break
     
     # 保存最终结果
-    final_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces)
+    final_mesh = trimesh.Trimesh(vertices=cloth_verts, faces=garment_faces, process=False)
     final_mesh.export(os.path.join(OUTPUT_DIR, "final_result.obj"))
     print(f"sim success,output saved at {OUTPUT_DIR}")
