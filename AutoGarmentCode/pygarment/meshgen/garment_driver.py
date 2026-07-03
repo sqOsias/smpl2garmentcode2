@@ -437,6 +437,7 @@ def _export_driven_obj_with_uv(out_path, driven_verts_m, boxmesh_obj_path):
 
     with open(out_path, 'w') as f:
         f.write("mtllib design_material.mtl\n")
+        f.write("usemtl panels_texture\n")
         for v in driven_cm:
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
         for u in merged_uv:
@@ -651,10 +652,40 @@ def drive_garment(
     final_mesh = trimesh.Trimesh(vertices=cloth_verts_m, faces=garment_faces, process=False)
     final_mesh.export(os.path.join(output_dir, "final_result_meters.obj"))
 
+    # ---------- 导出目标姿态人体 OBJ ----------
+    target_body_obj_path = os.path.join(output_dir, "target_body.obj")
+    body_mesh_target = trimesh.Trimesh(vertices=target_body_verts, faces=body_faces, process=False)
+    body_mesh_target.export(target_body_obj_path)
+    print(f"[driver] 目标姿态人体 OBJ → {target_body_obj_path}")
+
+    # ---------- 导出穿衣人体 OBJ (garment + body 合并) ----------
+    dressed_obj_path = os.path.join(output_dir, "dressed_body.obj")
+    # 服装在 cm 单位，人体在 m 单位；统一到 m 单位合并
+    driven_cm = cloth_verts_m * 100.0
+    body_cm = target_body_verts * 100.0
+    # 合并：先写人体顶点，再写服装顶点（面片索引偏移）
+    with open(dressed_obj_path, 'w') as f:
+        f.write("# Dressed body: target body + driven garment\n")
+        f.write(f"# Body vertices: {len(body_cm)}, Garment vertices: {len(driven_cm)}\n")
+        for v in body_cm:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for v in driven_cm:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for face in body_faces:
+            a, b, c = int(face[0]) + 1, int(face[1]) + 1, int(face[2]) + 1
+            f.write(f"f {a} {b} {c}\n")
+        offset = len(body_cm)
+        for face in garment_faces:
+            a, b, c = int(face[0]) + 1 + offset, int(face[1]) + 1 + offset, int(face[2]) + 1 + offset
+            f.write(f"f {a} {b} {c}\n")
+    print(f"[driver] 穿衣人体 OBJ → {dressed_obj_path}")
+
     return {
         'driven_obj': final_obj_path,
         'driven_verts_m': cloth_verts_m,
         'garment_faces': garment_faces,
         'target_body_v_m': target_body_verts,
         'target_body_f': body_faces,
+        'target_body_obj': target_body_obj_path,
+        'dressed_body_obj': dressed_obj_path,
     }
