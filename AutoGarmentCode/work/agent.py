@@ -10,11 +10,8 @@ class Agent:
         self.max_tokens = 4096
         self.model = "gpt-4o-2024-11-20"
         self.client = openai.OpenAI(
-            # api_key='sk-FJOtSwQcHzTLVLUqEf181cF66b264cBd84C092625702247d',
-            # sk-MNgJkSUqcZ8kBLz8569cE0Ef9cCc4aC3B592DcF1581f082e
-            # api_key='sk-FJOtSwQcHzTLVLUqEf181cF66b264cBd84C092625702247d',
-            api_key='sk-MNgJkSUqcZ8kBLz8569cE0Ef9cCc4aC3B592DcF1581f082e',
-            base_url='https://api.laozhang.ai/v1',
+            api_key='',
+            base_url='',
         )
 
     @staticmethod
