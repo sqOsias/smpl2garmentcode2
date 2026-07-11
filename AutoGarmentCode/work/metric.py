@@ -29,7 +29,7 @@ NON_GARMENT_LABELS = [0, 1, 10, 12, 13, 14, 15]
 DEFAULT_TAU = 0.005
 
 # 采样点数：论文在每个表面均匀采样 10000 点
-N_SAMPLE = 10000
+N_SAMPLE = 50000
 ICP_MAX_CORR_DIST = 0.3
 RANDOM_SEED = 42
 # CloSe 上装细类索引
@@ -386,7 +386,7 @@ def rotation_angle_deg(R: np.ndarray) -> float:
 def icp_refine(source_mesh: trimesh.Trimesh,
                target_mesh: trimesh.Trimesh,
                max_corr_dist: float = 0.3,
-               n_sample: int = 20000) -> Tuple[np.ndarray, np.ndarray, float, float]:
+               n_sample: int = 50000) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """对 source_mesh 做 ICP 精修对齐到 target_mesh。
 
     Returns:
@@ -635,7 +635,9 @@ def evaluate_single_sample(args) -> Dict:
     npz_path = os.path.join(args.data_root, f"{args.sample}.npz")
     output_dir = os.path.join(args.output_root, args.sample)
     smpl_json = os.path.join(args.output_root,args.sample,"hybrik","smpl.json")
-    driven_garment_obj = os.path.join(args.output_root,args.sample,"driven","final_result.obj")
+    # driven_garment_obj = os.path.join(args.output_root,args.sample,"driven","final_result.obj")
+    # driven_garment_obj = os.path.join(args.output_root,args.sample,"design","design_sim.obj")
+    driven_garment_obj = os.path.join(args.output_root,args.sample,"design","driven","final_result.obj")
     gender = args.gender
 
 
