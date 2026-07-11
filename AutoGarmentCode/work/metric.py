@@ -165,7 +165,7 @@ def load_smpl_params(smpl_json: str,npz_path: str):
     with open(smpl_json) as f:
         pred_json = json.load(f)
     pred_betas = np.array(pred_json['betas'], dtype=np.float32)
-    hybrik_pose = np.array(pred_json['pose'], dtype=np.float32)
+    # hybrik_pose = np.array(pred_json['pose'], dtype=np.float32)
 
     # GT pose 拆分
     gt_pose_t = torch.from_numpy(gt_pose).float().view(1, 72)
@@ -173,11 +173,21 @@ def load_smpl_params(smpl_json: str,npz_path: str):
     gt_global_orient = gt_pose_t[:, :3]
 
     # Pred: HybrIK body pose + 零 global orient (A-pose)
-    pred_body_pose = torch.from_numpy(hybrik_pose).float().view(1, 69)
+    # pred_body_pose = torch.from_numpy(hybrik_pose).float().view(1, 69)
+    # Pred pose: build_default_pose from export_smpl_mesh.py (match smpl.obj A-pose)
+    angle = np.pi / 4.0
+    angle2 = np.pi / 20.0
+    apose = torch.zeros((1, 24, 3), dtype=torch.float32)
+    apose[0, 16, 2] = -angle     # left elbow Z
+    apose[0, 17, 2] = angle      # right elbow Z
+    apose[0, 16, 1] = -angle2    # left elbow Y
+    apose[0, 17, 1] = angle2     # right elbow Y
+
+    pred_body_pose = apose.view(1, 72)[:, 3:]  # body_pose (69 dims)
     pred_global_orient = torch.zeros(1, 3)
 
     print(f"  GT  betas: {gt_betas.shape}, pose: {gt_pose.shape}, trans: {gt_trans}")
-    print(f"  Pred betas: {pred_betas.shape}, hybrik_pose: {hybrik_pose.shape}")
+    print(f"  Pred betas: {pred_betas.shape}, pred_body_pose: {pred_body_pose.shape}")
 
     return {
         'gt_betas': gt_betas,
