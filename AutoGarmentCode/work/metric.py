@@ -546,18 +546,24 @@ def save_metrics(full_metrics: dict, output_dir: str):
 
 
 def export_results(pred_mesh: trimesh.Trimesh,
+                   gt_mesh: trimesh.Trimesh,
                    pred_pts: np.ndarray,
                    gt_pts: np.ndarray,
                    output_dir: str):
-    """导出对齐后网格和采样的调试点云。"""
-    section("7. 导出调试文件")
+    """Export aligned garment meshes and debug point clouds."""
+    section("7. Export debug files")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # OBJ 网格
-    obj_path = os.path.join(output_dir, "garment_smpl_kabsch.obj")
+    # Pred garment mesh (aligned)
+    obj_path = os.path.join(output_dir, "pred_garment_kabsch.obj")
     pred_mesh.export(obj_path)
     print(f"  {obj_path} saved")
+
+    # GT garment mesh (aligned, from NPZ)
+    gt_obj_path = os.path.join(output_dir, "gt_garment.obj")
+    gt_mesh.export(gt_obj_path)
+    print(f"  {gt_obj_path} saved")
 
     # ASCII PLY 点云
     # for name, pts in [
@@ -622,7 +628,7 @@ def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str,gender:str
 
     metrics = get_cd_fscore(pred_pts, gt_pts)
     save_metrics_to_csv(metrics, output_dir)
-    export_results(pred_mesh, pred_pts, gt_pts, output_dir)
+    export_results(pred_mesh, gt_mesh, pred_pts, gt_pts, output_dir)
     print(f"F-SCORE and CD results saved to {output_dir}")
     return metrics
 
