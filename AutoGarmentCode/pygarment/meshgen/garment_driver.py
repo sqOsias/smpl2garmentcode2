@@ -528,10 +528,18 @@ def drive_garment(
     print(f"[driver] 参考人体: {len(body_verts_m)} 顶点, {len(body_faces)} 面")
 
     # ---------- 基准 SMPL 参数 ----------
+    # betas: HybrIK (smpl.json)
     pred_betas = torch.from_numpy(load_betas_from_json(base_smpl_json)).float().unsqueeze(0)
-    pred_pose = load_pose_from_json(base_smpl_json)
+    # pose: build_default_pose from export_smpl_mesh.py (match smpl.obj A-pose)
+    angle = np.pi / 4.0
+    angle2 = np.pi / 20.0
+    apose = torch.zeros((1, 24, 3), dtype=torch.float32)
+    apose[0, 16, 2] = -angle     # left elbow Z
+    apose[0, 17, 2] = angle      # right elbow Z
+    apose[0, 16, 1] = -angle2    # left elbow Y
+    apose[0, 17, 1] = angle2     # right elbow Y
     base_global_orient = torch.zeros(1, 3)
-    base_body_pose = torch.from_numpy(pred_pose).float().view(1, 69)
+    base_body_pose = apose.view(1, 72)[:, 3:]  # body_pose (69 dims)
 
     # ---------- 目标姿态 ----------
     data = np.load(target_pose_npz)
@@ -658,6 +666,14 @@ def drive_garment(
     body_mesh_target.export(target_body_obj_path)
     print(f"[driver] 目标姿态人体 OBJ → {target_body_obj_path}")
 
+    # ---------- 导出 HybrIK 预测的基准人体 OBJ (A-pose) ----------
+    base_body_verts = smpl_driver.get_body_verts(
+        betas=pred_betas, body_pose=base_body_pose, global_orient=base_global_orient
+    )
+    base_body_obj_path = os.path.join(output_dir, "base_body.obj")
+    trimesh.Trimesh(vertices=base_body_verts, faces=body_faces, process=False).export(base_body_obj_path)
+    print(f"[driver] HybrIK 基准人体 (A-pose) OBJ → {base_body_obj_path}")
+
     # ---------- 导出穿衣人体 OBJ (garment + body 合并) ----------
     dressed_obj_path = os.path.join(output_dir, "dressed_body.obj")
     # 服装在 cm 单位，人体在 m 单位；统一到 m 单位合并
@@ -687,5 +703,6 @@ def drive_garment(
         'target_body_v_m': target_body_verts,
         'target_body_f': body_faces,
         'target_body_obj': target_body_obj_path,
+        'base_body_obj': base_body_obj_path,
         'dressed_body_obj': dressed_obj_path,
     }
