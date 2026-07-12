@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple, Optional
 import csv
 import smplx
 import open3d as o3d
+from scipy.spatial import cKDTree
 
 SMPL_MODEL_PATH = '/root/wyc/code/smpl2garmentcode2/smpl_models'
 
@@ -25,12 +26,11 @@ CLOTH_LABELS = {
 # 非服装区域（身体/配饰/毛发等），计算服装真值网格时排除
 NON_GARMENT_LABELS = [0, 1, 10, 12, 13, 14, 15]
 
-# F-Score 距离阈值：论文 τ = 5mm = 0.005 m
-DEFAULT_TAU = 0.005
+# F-Score 正式距离阈值：论文勘误后采用 τ = 10mm = 0.010m
+DEFAULT_TAU = 0.010
 
-# 采样点数：论文在每个表面均匀采样 10000 点
-N_SAMPLE = 50000
-ICP_MAX_CORR_DIST = 0.3
+# 论文协议：在两个网格表面分别均匀采样 10000 点
+N_SAMPLE = 10000
 RANDOM_SEED = 42
 # CloSe 上装细类索引
 UPPER_LABELS = [2, 3, 4, 5, 11, 17]  # Shirt/TShirt/Vest/Coat/Hoodies/Jacket
@@ -379,60 +379,35 @@ def build_gt_garment_mesh(data: dict, non_garment_labels: Tuple[int, ...]) -> tr
     gar_faces_remapped = np.array([
         [old_to_new[f[0]], old_to_new[f[1]], old_to_new[f[2]]]
         for f in gar_faces_filtered
-    ])
+    ], dtype=np.int64).reshape(-1, 3)
+
+    # 仅做与预测无关的确定性清理：移除非有限/退化面和未引用顶点。
+    # 不按预测结果删除 GT 点，也不只保留最大分量（上下装可为独立分量）。
+    removed_faces = 0
+    if len(gar_faces_remapped) > 0:
+        tri = gar_pts[gar_faces_remapped]
+        finite_faces = np.isfinite(tri).all(axis=(1, 2))
+        double_area = np.linalg.norm(
+            np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1
+        )
+        valid_faces = finite_faces & (double_area > 1e-12)
+        removed_faces = int((~valid_faces).sum())
+        gar_faces_remapped = gar_faces_remapped[valid_faces]
 
     mesh = trimesh.Trimesh(gar_pts, gar_faces_remapped, process=False)
-    print(f"  GT garment mesh: {len(gar_pts)} verts, {len(gar_faces_remapped)} faces")
-    print(f"  GT garment Y=[{gar_pts[:, 1].min():.3f}, {gar_pts[:, 1].max():.3f}]")
+    mesh.remove_unreferenced_vertices()
+    print(f"  GT garment mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    print(f"  Removed invalid/degenerate GT faces: {removed_faces}")
+    if len(mesh.vertices) > 0:
+        print(f"  GT garment Y=[{mesh.vertices[:, 1].min():.3f}, {mesh.vertices[:, 1].max():.3f}]")
     return mesh
 
 
-# ==================== 6. ICP 精修 ====================
+# ==================== 6. 距离指标 ====================
 def rotation_angle_deg(R: np.ndarray) -> float:
     """从 3x3 旋转矩阵提取旋转角（度）。"""
     cos = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
     return float(np.degrees(np.arccos(cos)))
-
-def icp_refine(source_mesh: trimesh.Trimesh,
-               target_mesh: trimesh.Trimesh,
-               max_corr_dist: float = 0.3,
-               n_sample: int = 50000) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    """对 source_mesh 做 ICP 精修对齐到 target_mesh。
-
-    Returns:
-        R_icp: (3, 3) 旋转矩阵
-        t_icp: (3,)   平移向量
-        fitness:       ICP fitness
-        inlier_rmse:   ICP inlier RMSE (米)
-    """
-    src_pts, _ = trimesh.sample.sample_surface(source_mesh, n_sample)
-    tgt_pts, _ = trimesh.sample.sample_surface(target_mesh, n_sample)
-
-    src_pc = o3d.geometry.PointCloud()
-    src_pc.points = o3d.utility.Vector3dVector(src_pts.astype(np.float64))
-
-    tgt_pc = o3d.geometry.PointCloud()
-    tgt_pc.points = o3d.utility.Vector3dVector(tgt_pts.astype(np.float64))
-
-    reg = o3d.pipelines.registration.registration_icp(
-        src_pc, tgt_pc,
-        max_correspondence_distance=max_corr_dist,
-        init=np.eye(4),
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=100,
-        ),
-    )
-
-    M = reg.transformation
-    R_icp = M[:3, :3]
-    t_icp = M[:3, 3]
-
-    print(f"  ICP fitness={reg.fitness:.4f}  inlier_rmse={reg.inlier_rmse * 100:.2f}cm")
-    print(f"  ICP 旋转={rotation_angle_deg(R_icp):.2f}deg  平移={t_icp}")
-
-    return R_icp, t_icp, reg.fitness, reg.inlier_rmse
-
 
 def get_cd_fscore(pred_pts: np.ndarray, gt_pts: np.ndarray,
                     thresholds_mm: Tuple[int, ...] = (5, 10, 20, 30, 50)):
@@ -441,12 +416,18 @@ def get_cd_fscore(pred_pts: np.ndarray, gt_pts: np.ndarray,
     Returns:
         dict: 包含 cd_cm, fscore@Xmm, p2g, g2p 等
     """
-    P = torch.tensor(pred_pts, dtype=torch.float32).unsqueeze(0)
-    Q = torch.tensor(gt_pts, dtype=torch.float32).unsqueeze(0)
-    D = torch.cdist(P, Q, p=2).squeeze(0)
+    pred_pts = np.asarray(pred_pts, dtype=np.float64)
+    gt_pts = np.asarray(gt_pts, dtype=np.float64)
+    if pred_pts.ndim != 2 or pred_pts.shape[1] != 3 or len(pred_pts) == 0:
+        raise ValueError(f"pred_pts must be a non-empty (N, 3) array, got {pred_pts.shape}")
+    if gt_pts.ndim != 2 or gt_pts.shape[1] != 3 or len(gt_pts) == 0:
+        raise ValueError(f"gt_pts must be a non-empty (N, 3) array, got {gt_pts.shape}")
+    if not np.isfinite(pred_pts).all() or not np.isfinite(gt_pts).all():
+        raise ValueError("Point clouds contain NaN or Inf")
 
-    p2g = D.min(dim=1).values.numpy()  # pred → GT 最近距离
-    g2p = D.min(dim=0).values.numpy()  # GT → pred 最近距离
+    # KD-tree 避免构造 N×M 的完整距离矩阵。
+    p2g = cKDTree(gt_pts).query(pred_pts, k=1, workers=-1)[0]
+    g2p = cKDTree(pred_pts).query(gt_pts, k=1, workers=-1)[0]
 
     cd_cm = 0.5 * (p2g.mean() + g2p.mean()) * 100.0
 
@@ -458,8 +439,8 @@ def get_cd_fscore(pred_pts: np.ndarray, gt_pts: np.ndarray,
     print(f"\n  多阈值 F-Score:")
     for tau_mm in thresholds_mm:
         tau = tau_mm / 1000.0
-        pr = (p2g < tau).mean()
-        rc = (g2p < tau).mean()
+        pr = (p2g <= tau).mean()
+        rc = (g2p <= tau).mean()
         fs = (2 * pr * rc / (pr + rc)) if (pr + rc) > 0 else 0.0
         fscores[tau_mm] = {'fscore': fs, 'precision': pr, 'recall': rc}
         print(f"    F@{tau_mm}mm = {fs:.4f}  (P={pr * 100:.1f}%, R={rc * 100:.1f}%)")
@@ -587,37 +568,61 @@ def export_results(pred_mesh: trimesh.Trimesh,
     except Exception as e:
         print(f"  [Error] 保存调试点云失败: {e}")
 
-def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str,gender:str,
-                           output_dir: Optional[str] = None) -> Dict:
-    """完整评估管线: SMPL参数 → 身体生成 → Kabsch → 服装加载 → ICP → CD/F-Score。
-    与 compute_fscore_cd.py 计算流程完全相同。"""
+def evaluate_driven_garment(
+    driven_verts_m: np.ndarray,
+    driven_faces: np.ndarray,
+    pred_target_body_verts_m: np.ndarray,
+    gt_target_body_verts_m: np.ndarray,
+    gt_data: dict,
+    torso_mask: Optional[np.ndarray] = None,
+    output_dir: Optional[str] = None,
+) -> Dict:
+    """以内存数据评估驱动服装，不使用 GT 服装执行 ICP。
 
-    # 1. 加载 SMPL 参数
-    smpl_params = load_smpl_params(smpl_json, npz_path)
+    驱动服装与 ``pred_target_body_verts_m`` 必须处于同一坐标系。通过具有
+    相同 SMPL 顶点索引的目标姿态人体求 Pred→GT 刚性变换，再将同一变换
+    应用于服装。GT 服装仅参与最终距离计算，不参与对齐。
+    """
+    garment_v = np.asarray(driven_verts_m, dtype=np.float64)
+    garment_f = np.asarray(driven_faces, dtype=np.int64)
+    pred_body = np.asarray(pred_target_body_verts_m, dtype=np.float64)
+    gt_body = np.asarray(gt_target_body_verts_m, dtype=np.float64)
 
-    # 2. 生成 SMPL 身体
-    gt_body, pred_body = build_smpl_bodies(smpl_params,gender)
+    if garment_v.ndim != 2 or garment_v.shape[1] != 3 or len(garment_v) == 0:
+        raise ValueError(f"driven_verts_m must be a non-empty (N, 3) array, got {garment_v.shape}")
+    if garment_f.ndim != 2 or garment_f.shape[1] != 3 or len(garment_f) == 0:
+        raise ValueError(f"driven_faces must be a non-empty (F, 3) array, got {garment_f.shape}")
+    if pred_body.shape != gt_body.shape or pred_body.ndim != 2 or pred_body.shape[1] != 3:
+        raise ValueError(
+            "Predicted and GT SMPL bodies must have matching (N, 3) topology, "
+            f"got {pred_body.shape} and {gt_body.shape}"
+        )
+    if not all(np.isfinite(x).all() for x in (garment_v, pred_body, gt_body)):
+        raise ValueError("Driven garment or SMPL body contains NaN or Inf")
+    if garment_f.min() < 0 or garment_f.max() >= len(garment_v):
+        raise ValueError("driven_faces contains an out-of-range vertex index")
 
-    # 3. Kabsch 躯干对齐 (Pred body → GT body)
-    R_body, t_body = body_kabsch_align(gt_body, pred_body)
-
-    # 4. 加载服装 + 撤销Y偏移 + 应用 Kabsch 变换
-    garment_v, garment_f = load_garment(garment_obj)
-    # 撤销 export_smpl_mesh.py 的 Y 偏移：服装在 shifted 坐标系(Y≈[0,1.8])，
-    # 需转回 SMPL 原生坐标系(Y≈[-1.3,0.6])才能正确应用身体 Kabsch 变换
-    garment_v[:, 1] += pred_body[:, 1].min()
+    section("3. SMPL torso alignment: Pred body → GT body")
+    if torso_mask is None:
+        torso_mask = get_torso_mask(gt_body)
+    else:
+        torso_mask = np.asarray(torso_mask, dtype=bool).reshape(-1)
+        if len(torso_mask) != len(gt_body):
+            raise ValueError(
+                f"torso_mask length {len(torso_mask)} does not match SMPL vertices {len(gt_body)}"
+            )
+    if int(torso_mask.sum()) < 3:
+        raise ValueError("Unable to select enough torso vertices for rigid alignment")
+    R_body, t_body = kabsch_align(pred_body[torso_mask], gt_body[torso_mask])
     garment_v = apply_rigid_transform(garment_v, R_body, t_body)
+    print(f"  Torso verts: {int(torso_mask.sum())}")
+    print(f"  Rotation: {rotation_angle_deg(R_body):.3f} deg")
+    print(f"  Translation: {t_body}")
 
-    # 5. 构建 GT 服装网格
-    gt_mesh = build_gt_garment_mesh(np.load(npz_path), NON_GARMENT_LABELS)
+    gt_mesh = build_gt_garment_mesh(gt_data, tuple(NON_GARMENT_LABELS))
+    if len(gt_mesh.vertices) == 0 or len(gt_mesh.faces) == 0:
+        raise ValueError("GT garment mesh is empty after semantic filtering")
 
-    # 6. ICP 精修 (garment → GT garment)
-    garment_mesh = trimesh.Trimesh(garment_v, garment_f)
-    R_icp, t_icp, fitness, rmse  = icp_refine(garment_mesh, gt_mesh,
-                                max_corr_dist=ICP_MAX_CORR_DIST)
-    garment_v = apply_rigid_transform(garment_v, R_icp, t_icp)
-
-    # 7. 采样 & 评估
     np.random.seed(RANDOM_SEED)
     pred_mesh = trimesh.Trimesh(garment_v, garment_f, process=False)
     pred_pts, _ = trimesh.sample.sample_surface(pred_mesh, N_SAMPLE)
@@ -627,10 +632,50 @@ def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str,gender:str
     print(f"  GT garment Y=[{gt_pts[:, 1].min():.3f}, {gt_pts[:, 1].max():.3f}]")
 
     metrics = get_cd_fscore(pred_pts, gt_pts)
-    save_metrics_to_csv(metrics, output_dir)
-    export_results(pred_mesh, gt_mesh, pred_pts, gt_pts, output_dir)
-    print(f"F-SCORE and CD results saved to {output_dir}")
+    metrics['fscore_10mm'] = metrics['fscores'][10]['fscore']
+    metrics['alignment'] = {'R': R_body, 't': t_body}
+    if output_dir is not None:
+        save_metrics_to_csv(metrics, output_dir)
+        export_results(pred_mesh, gt_mesh, pred_pts, gt_pts, output_dir)
+        print(f"F-SCORE and CD results saved to {output_dir}")
     return metrics
+
+
+def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str, gender: str,
+                      output_dir: Optional[str] = None) -> Dict:
+    """兼容历史文件评估入口；正式全流程应调用 ``evaluate_driven_garment``。
+
+    ``smpl_json`` 和 ``gender`` 为兼容旧调用保留。驱动目录必须同时包含
+    ``final_result.obj`` 与 ``target_body.obj``，以保证服装和预测人体处于
+    完全相同的驱动坐标系。
+    """
+    del smpl_json
+    garment_v, garment_f = load_garment(garment_obj)
+    target_body_path = os.path.join(os.path.dirname(garment_obj), "target_body.obj")
+    if not os.path.exists(target_body_path):
+        raise FileNotFoundError(
+            f"Missing driven target body required for SMPL alignment: {target_body_path}"
+        )
+    pred_body_mesh = trimesh.load(target_body_path, process=False, force='mesh')
+    pred_body = np.asarray(pred_body_mesh.vertices, dtype=np.float64)
+
+    with np.load(npz_path) as npz:
+        gt_data = {key: npz[key] for key in npz.files}
+    gt_pose = torch.from_numpy(np.asarray(gt_data['pose'], dtype=np.float32)).view(1, 72)
+    model = smplx.create(model_path=SMPL_MODEL_PATH, model_type='smpl', gender=gender)
+    with torch.no_grad():
+        gt_output = model(
+            betas=torch.from_numpy(np.asarray(gt_data['betas'], dtype=np.float32)).view(1, -1),
+            body_pose=gt_pose[:, 3:],
+            global_orient=gt_pose[:, :3],
+        )
+    gt_body = gt_output.vertices.squeeze(0).cpu().numpy()
+    dominant_joint = model.lbs_weights.argmax(dim=1).cpu().numpy()
+    torso_mask = np.isin(dominant_joint, [0, 3, 6, 9])
+    return evaluate_driven_garment(
+        garment_v, garment_f, pred_body, gt_body, gt_data,
+        torso_mask=torso_mask, output_dir=output_dir,
+    )
 
 
 def evaluate_single_sample(args) -> Dict:

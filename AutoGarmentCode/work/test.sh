@@ -5,9 +5,9 @@ set -euo pipefail
 # Warp 驱动服装 → GT pose → 评估 CD / F-Score
 #
 # 用法:
-#   bash run.sh [SAMPLE] [GENDER]
+#   bash test.sh [SAMPLE] [GENDER]
 #       SAMPLE  CloSe 样本名（默认 10014_2464）
-#       GENDER  性别 male|female（默认 male）
+#       GENDER  性别 male|female（默认 female）
 #
 # 阶段开关（环境变量）:
 #   DO_DRIVE=1    Warp 驱动服装到 GT pose
@@ -16,10 +16,10 @@ set -euo pipefail
 # 依赖 conda 环境: nvidiawarp
 # =============================================================================
 
-SAMPLE="${1:-10043_4613}"
+SAMPLE="${1:-10112_9583}"
 GENDER="${2:-male}"
 
-DO_DRIVE="${DO_DRIVE:-1}"
+DO_DRIVE="${DO_DRIVE:-0}"
 DO_METRIC="${DO_METRIC:-1}"
 
 # ---- 路径 ----

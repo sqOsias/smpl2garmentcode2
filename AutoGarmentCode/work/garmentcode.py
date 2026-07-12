@@ -5,6 +5,7 @@ sys.path.append(os.getcwd())
 import argparse
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 from assets.garment_programs.meta_garment import MetaGarment
@@ -115,8 +116,11 @@ if __name__ == '__main__':
 
 	# --- pose driven (optional) ---
 	if args.target_pose:
+		if not args.base_smpl_json:
+			raise ValueError('--base_smpl_json is required when --target_pose is provided')
 		from pygarment.meshgen.garment_driver import drive_garment
 		from pygarment.meshgen.render.pythonrender import render_images
+		from work.metric import evaluate_driven_garment, evaluate_meta_accuracy, save_metrics
 
 		render_props = props['render']
 
@@ -127,6 +131,8 @@ if __name__ == '__main__':
 		print(f'  body OBJ:  {paths.in_body_obj}')
 
 		driven_dir = str(paths.out_el / 'driven')
+		with np.load(args.target_pose) as npz:
+			target_data = {key: npz[key] for key in npz.files}
 
 		driven_result = drive_garment(
 			garment_obj_path=str(paths.g_sim),
@@ -135,10 +141,40 @@ if __name__ == '__main__':
 			smpl_model_path=args.smpl_model_path,
 			base_smpl_json=args.base_smpl_json,
 			target_pose_npz=args.target_pose,
+			target_data=target_data,
 			gender=args.gender,
 			output_dir=driven_dir,
 			sim_config_path=args.sim_config,
 		)
+
+		# 驱动结果直接以内存数组评估，避免重新加载 NPZ/OBJ/SMPL。
+		# 对齐仅使用同拓扑 SMPL 人体顶点，不使用 GT 服装执行 ICP。
+		metric_output_dir = str(Path(args.design_path).parent)
+		geometry_metrics = evaluate_driven_garment(
+			driven_verts_m=driven_result['driven_verts_m'],
+			driven_faces=driven_result['garment_faces'],
+			pred_target_body_verts_m=driven_result['target_body_v_m'],
+			gt_target_body_verts_m=driven_result['gt_target_body_v_m'],
+			gt_data=target_data,
+			torso_mask=driven_result['smpl_torso_mask'],
+			output_dir=metric_output_dir,
+		)
+		class_acc, correct = evaluate_meta_accuracy(
+			{'design': design}, target_data['garments']
+		)
+		full_metrics = {
+			'sample_name': Path(args.design_path).parent.name,
+			'valid_structure': 1.0,
+			'sim_success': 1.0,
+			'class_acc': class_acc,
+			'upper_correct': float(correct['upper']),
+			'bottom_correct': float(correct['bottom']),
+			'connected_correct': float(correct['connected']),
+			'chamfer_distance': geometry_metrics['cd_cm'],
+			'f_score': geometry_metrics['fscore_10mm'],
+			'fscores': geometry_metrics['fscores'],
+		}
+		save_metrics(full_metrics, metric_output_dir)
 
 		# render driven garment + target pose body
 		# render_images 内部 load_meshes 做 /100 (cm→m)

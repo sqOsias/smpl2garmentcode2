@@ -191,15 +191,18 @@ def body_collision_kernel(
 @wp.kernel
 def attachment_kernel(
     cloth_pos: wp.array(dtype=wp.vec3),
+    cloth_vel: wp.array(dtype=wp.vec3),
     cloth_idx: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3),
     strength: float,
+    velocity_scale: float,
 ):
     tid = wp.tid()
     idx = cloth_idx[tid]
     p = cloth_pos[idx]
     t = target_pos[tid]
     cloth_pos[idx] = p + (t - p) * strength
+    cloth_vel[idx] = cloth_vel[idx] * velocity_scale
 
 
 # ======================================
@@ -287,8 +290,10 @@ class WarpClothSimulator:
                 mass=float(particle_masses[i]),
             )
 
-        edge_ke = min(float(sim_config["material"]["garment_edge_ke"]), ke_cap)
-        edge_ke = max(edge_ke, 1000.0)
+        # 保持原驱动器的参数语义：garment_edge_* 用于网格结构边，
+        # spring_* 用于跨共享边的对角弹簧。不要与 Warp cloth triangle
+        # 模型的 tri_* 参数直接互换，两种模型的刚度含义并不等价。
+        edge_ke = min(max(float(sim_config["material"]["garment_edge_ke"]), 1000.0), ke_cap)
         edge_kd = min(float(sim_config["material"]["garment_edge_kd"]), kd_cap)
         for i in range(len(struct_edges)):
             a, b = struct_edges[i]
@@ -316,8 +321,8 @@ class WarpClothSimulator:
             points=wp.array(body_verts, dtype=wp.vec3, device=self.device),
             indices=wp.array(body_faces.flatten(), dtype=int, device=self.device),
         )
-        raw_thickness = sim_config["options"]["body_collision_thickness"]
-        self.collision_thickness = float(min(raw_thickness, 0.005))
+        raw_thickness_cm = sim_config["options"]["body_collision_thickness"]
+        self.collision_thickness = float(min(raw_thickness_cm * 0.01, 0.005))
         self.body_friction = sim_config["options"]["body_friction"]
         self.query_dist = float(max(self.collision_thickness * 20.0, 0.1))
 
@@ -360,17 +365,26 @@ class WarpClothSimulator:
     def _apply_attachment(self, body_verts_np, dt):
         if not self.enable_attachment:
             return
-        alpha = min(1.0, self.current_frame / self.attach_frames)
+        alpha = min(1.0, self.current_frame / max(1, self.attach_frames))
         current_stiff = self.attach_stiffness * alpha
-        strength = float(min(1.0, current_stiff * dt * 0.1))
+        # attachment_stiffness 来自原 Warp 约束配置，不能直接作为单帧
+        # 位置插值系数。旧公式在 current_stiff=600 时突然钳到 1.0，
+        # 会把绑定点瞬间硬投影到人体并使相邻弹簧爆炸。这里将其映射为
+        # 连续时间响应率，并限制每帧最多修正 25% 的剩余距离。
+        response_rate = current_stiff * 0.01
+        strength = float(min(0.25, 1.0 - np.exp(-response_rate * dt)))
         if strength <= 0.0:
             return
         target_pos = body_verts_np[self.attach_body_idx].astype(np.float32)
         target_pos_wp = wp.array(target_pos, dtype=wp.vec3, device=self.device)
+        velocity_scale = float(max(0.0, 1.0 - self.attach_damping * dt))
         wp.launch(
             kernel=attachment_kernel,
             dim=len(self.attach_cloth_idx),
-            inputs=[self.state_0.particle_q, self.attach_cloth_idx_wp, target_pos_wp, strength],
+            inputs=[
+                self.state_0.particle_q, self.state_0.particle_qd,
+                self.attach_cloth_idx_wp, target_pos_wp, strength, velocity_scale,
+            ],
             device=self.device,
         )
 
@@ -403,8 +417,13 @@ class WarpClothSimulator:
 
         # 速度阻尼 + 钳制
         damping = self.config["options"]["global_damping_factor"]
-        max_vel = self.config["options"]["global_max_velocity"]
+        max_vel = self.config["options"]["global_max_velocity"] * 0.01  # cm/s → m/s
         vel_np = self.state_0.particle_qd.numpy()
+        pos_np = self.state_0.particle_q.numpy()
+        if not np.isfinite(pos_np).all() or not np.isfinite(vel_np).all():
+            raise FloatingPointError(
+                f"Cloth solver produced NaN/Inf at simulation frame {self.current_frame}"
+            )
         if damping > 0:
             vel_np *= (1.0 - damping)
         norms = np.linalg.norm(vel_np, axis=1, keepdims=True)
@@ -413,7 +432,7 @@ class WarpClothSimulator:
             vel_np[mask] = vel_np[mask] / norms[mask] * max_vel
         self.state_0.particle_qd.assign(wp.array(vel_np, dtype=wp.vec3, device=self.device))
 
-        return self.state_0.particle_q.numpy()
+        return pos_np
 
 
 # ======================================
@@ -466,6 +485,7 @@ def drive_garment(
     smpl_model_path,
     base_smpl_json,
     target_pose_npz,
+    target_data=None,
     gender='male',
     output_dir=None,
     sim_config_path=None,
@@ -479,7 +499,8 @@ def drive_garment(
         body_obj_path:     参考人体 OBJ (米)
         smpl_model_path:   SMPL 模型目录
         base_smpl_json:    基准 SMPL 参数 JSON {betas, pose}
-        target_pose_npz:   目标姿态 NPZ {pose, [betas]}
+        target_pose_npz:   目标姿态 NPZ 路径；target_data 未提供时使用
+        target_data:       已加载的目标 NPZ 字典，用于与后续指标计算复用
         gender:            'male' / 'female'
         output_dir:        输出目录 (默认在 garment 同级创建 'driven/')
         sim_config_path:   仿真配置 YAML 路径
@@ -534,16 +555,22 @@ def drive_garment(
     angle = np.pi / 4.0
     angle2 = np.pi / 20.0
     apose = torch.zeros((1, 24, 3), dtype=torch.float32)
-    apose[0, 16, 2] = -angle     # left elbow Z
-    apose[0, 17, 2] = angle      # right elbow Z
-    apose[0, 16, 1] = -angle2    # left elbow Y
-    apose[0, 17, 1] = angle2     # right elbow Y
+    apose[0, 16, 2] = -angle     # left shoulder Z
+    apose[0, 17, 2] = angle      # right shoulder Z
+    apose[0, 16, 1] = -angle2    # left shoulder Y
+    apose[0, 17, 1] = angle2     # right shoulder Y
     base_global_orient = torch.zeros(1, 3)
     base_body_pose = apose.view(1, 72)[:, 3:]  # body_pose (69 dims)
 
     # ---------- 目标姿态 ----------
-    data = np.load(target_pose_npz)
-    pose_full = torch.from_numpy(data["pose"]).float().view(1, 72)
+    if target_data is None:
+        if target_pose_npz is None:
+            raise ValueError("target_pose_npz or target_data must be provided")
+        with np.load(target_pose_npz) as npz:
+            target_data = {key: npz[key] for key in npz.files}
+    if "pose" not in target_data or "betas" not in target_data:
+        raise ValueError("target_data must contain 'pose' and 'betas'")
+    pose_full = torch.from_numpy(np.asarray(target_data["pose"], dtype=np.float32)).view(1, 72)
     target_global_orient = pose_full[:, :3]
     target_body_pose = pose_full[:, 3:]
 
@@ -555,8 +582,23 @@ def drive_garment(
         base_body_pose=base_body_pose,
         base_global_orient=base_global_orient,
     )
-    offset = smpl_driver.align_to_reference(body_verts_m)
-    print(f"[driver] SMPL 对齐偏移: {offset}")
+    align_offset = smpl_driver.align_to_reference(body_verts_m)
+    print(f"[driver] SMPL 对齐偏移: {align_offset}")
+
+    # GT 人体保持在数据集/SMPL 原生坐标系。评估时用同索引人体顶点求
+    # Pred→GT 刚性变换，服装与预测人体共同变换，不使用 GT 服装做 ICP。
+    gt_betas = torch.from_numpy(
+        np.asarray(target_data["betas"], dtype=np.float32)
+    ).view(1, -1)
+    with torch.no_grad():
+        gt_body_output = smpl_driver.model(
+            betas=gt_betas,
+            body_pose=target_body_pose,
+            global_orient=target_global_orient,
+        )
+    gt_target_body_verts = gt_body_output.vertices.squeeze(0).cpu().numpy().astype(np.float32)
+    dominant_joint = smpl_driver.model.lbs_weights.argmax(dim=1).cpu().numpy()
+    torso_mask = np.isin(dominant_joint, [0, 3, 6, 9])
 
     # ---------- 布料仿真器 ----------
     sim = WarpClothSimulator(
@@ -593,7 +635,7 @@ def drive_garment(
     rot_target_global = R.from_rotvec(target_global_np)
 
     for frame in range(transition_frames):
-        alpha = frame / transition_frames
+        alpha = (frame + 1) / transition_frames
 
         interp_body_np = np.zeros_like(base_body_np)
         for j in range(base_body_np.shape[0]):
@@ -626,7 +668,7 @@ def drive_garment(
 
     # ========== 阶段三：目标姿态稳定 ==========
     max_sim_steps = min(sim_config["max_sim_steps"], 2500)
-    static_threshold = sim_config["static_threshold"]
+    static_threshold = sim_config["static_threshold"] * GARMENT_SCALE  # cm → m
     print(f"[driver] 阶段三: 目标姿态稳定 (≤{max_sim_steps} 步)")
 
     target_body_verts = smpl_driver.get_body_verts(
@@ -634,6 +676,8 @@ def drive_garment(
     )
 
     prev_verts = cloth_verts_m.copy()
+    static_frames = 0
+    required_static_frames = 30
     for step in range(max_sim_steps):
         sim.update_body_collider(target_body_verts)
         cloth_verts_m = sim.step(target_body_verts, dt=DT, gravity_enabled=True)
@@ -646,7 +690,12 @@ def drive_garment(
             mesh.export(os.path.join(output_dir, f"sim_{step:04d}.obj"))
             print(f"  [driver] Step {step}, max displacement: {max_displacement:.6f}")
 
-        if max_displacement < static_threshold and step > 50:
+        if max_displacement < static_threshold:
+            static_frames += 1
+        else:
+            static_frames = 0
+
+        if static_frames >= required_static_frames and step > 50:
             print(f"[driver] 仿真在第 {step} 步收敛")
             break
 
@@ -690,9 +739,11 @@ def drive_garment(
         for face in body_faces:
             a, b, c = int(face[0]) + 1, int(face[1]) + 1, int(face[2]) + 1
             f.write(f"f {a} {b} {c}\n")
-        offset = len(body_cm)
+        face_offset = len(body_cm)
         for face in garment_faces:
-            a, b, c = int(face[0]) + 1 + offset, int(face[1]) + 1 + offset, int(face[2]) + 1 + offset
+            a, b, c = (int(face[0]) + 1 + face_offset,
+                       int(face[1]) + 1 + face_offset,
+                       int(face[2]) + 1 + face_offset)
             f.write(f"f {a} {b} {c}\n")
     print(f"[driver] 穿衣人体 OBJ → {dressed_obj_path}")
 
@@ -701,7 +752,11 @@ def drive_garment(
         'driven_verts_m': cloth_verts_m,
         'garment_faces': garment_faces,
         'target_body_v_m': target_body_verts,
+        'gt_target_body_v_m': gt_target_body_verts,
+        'smpl_torso_mask': torso_mask,
         'target_body_f': body_faces,
+        'align_offset_m': align_offset,
+        'target_data': target_data,
         'target_body_obj': target_body_obj_path,
         'base_body_obj': base_body_obj_path,
         'dressed_body_obj': dressed_obj_path,
