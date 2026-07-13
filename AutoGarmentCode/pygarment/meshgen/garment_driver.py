@@ -490,6 +490,7 @@ def drive_garment(
     output_dir=None,
     sim_config_path=None,
     save_intermediate=True,
+    drive_to_gt_shape=False,
 ):
     """将服装从基准姿态驱动到目标 SMPL 姿态。
 
@@ -505,6 +506,7 @@ def drive_garment(
         output_dir:        输出目录 (默认在 garment 同级创建 'driven/')
         sim_config_path:   仿真配置 YAML 路径
         save_intermediate: 是否保存中间结果 OBJ
+        drive_to_gt_shape: 是否将碰撞人体同时过渡到 CloSe GT neutral shape
 
     Returns:
         dict:
@@ -604,6 +606,7 @@ def drive_garment(
     gt_template_verts = gt_model.v_template.detach().cpu().numpy().astype(np.float32)
     dominant_joint = gt_model.lbs_weights.argmax(dim=1).cpu().numpy()
     torso_mask = np.isin(dominant_joint, [0, 3, 6, 9])
+    gt_target_body_aligned = gt_target_body_verts + align_offset
 
     # ---------- 布料仿真器 ----------
     sim = WarpClothSimulator(
@@ -656,9 +659,26 @@ def drive_garment(
         interp_body = torch.from_numpy(interp_body_np).float().view(1, 69)
         interp_global = torch.from_numpy(interp_global_np).float().view(1, 3)
 
-        interp_body_verts = smpl_driver.get_body_verts(
+        pred_interp_body_verts = smpl_driver.get_body_verts(
             betas=pred_betas, body_pose=interp_body, global_orient=interp_global
         )
+        if drive_to_gt_shape:
+            with torch.no_grad():
+                gt_interp_output = gt_model(
+                    betas=gt_betas,
+                    body_pose=interp_body,
+                    global_orient=interp_global,
+                )
+            gt_interp_body_verts = (
+                gt_interp_output.vertices.squeeze(0).cpu().numpy().astype(np.float32)
+                + align_offset
+            )
+            interp_body_verts = (
+                (1.0 - alpha) * pred_interp_body_verts
+                + alpha * gt_interp_body_verts
+            ).astype(np.float32)
+        else:
+            interp_body_verts = pred_interp_body_verts
         sim.update_body_collider(interp_body_verts)
         cloth_verts_m = sim.step(interp_body_verts, dt=DT, gravity_enabled=True)
 
@@ -676,9 +696,12 @@ def drive_garment(
     static_threshold = sim_config["static_threshold"] * GARMENT_SCALE  # cm → m
     print(f"[driver] 阶段三: 目标姿态稳定 (≤{max_sim_steps} 步)")
 
-    target_body_verts = smpl_driver.get_body_verts(
-        betas=pred_betas, body_pose=target_body_pose, global_orient=target_global_orient
-    )
+    if drive_to_gt_shape:
+        target_body_verts = gt_target_body_aligned
+    else:
+        target_body_verts = smpl_driver.get_body_verts(
+            betas=pred_betas, body_pose=target_body_pose, global_orient=target_global_orient
+        )
 
     prev_verts = cloth_verts_m.copy()
     static_frames = 0
@@ -763,6 +786,7 @@ def drive_garment(
         'target_body_f': body_faces,
         'align_offset_m': align_offset,
         'target_data': target_data,
+        'drive_to_gt_shape': drive_to_gt_shape,
         'target_body_obj': target_body_obj_path,
         'base_body_obj': base_body_obj_path,
         'dressed_body_obj': dressed_obj_path,
