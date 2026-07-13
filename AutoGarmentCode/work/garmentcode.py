@@ -155,6 +155,7 @@ if __name__ == '__main__':
 			driven_faces=driven_result['garment_faces'],
 			pred_target_body_verts_m=driven_result['target_body_v_m'],
 			gt_target_body_verts_m=driven_result['gt_target_body_v_m'],
+			gt_template_verts_m=driven_result['gt_template_v_m'],
 			gt_data=target_data,
 			torso_mask=driven_result['smpl_torso_mask'],
 			output_dir=metric_output_dir,
@@ -173,6 +174,7 @@ if __name__ == '__main__':
 			'chamfer_distance': geometry_metrics['cd_cm'],
 			'f_score': geometry_metrics['fscore_10mm'],
 			'fscores': geometry_metrics['fscores'],
+			'scan_alignment': geometry_metrics['scan_alignment'],
 		}
 		save_metrics(full_metrics, metric_output_dir)
 

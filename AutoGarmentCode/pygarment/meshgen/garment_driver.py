@@ -585,19 +585,24 @@ def drive_garment(
     align_offset = smpl_driver.align_to_reference(body_verts_m)
     print(f"[driver] SMPL 对齐偏移: {align_offset}")
 
-    # GT 人体保持在数据集/SMPL 原生坐标系。评估时用同索引人体顶点求
-    # Pred→GT 刚性变换，服装与预测人体共同变换，不使用 GT 服装做 ICP。
+    # CloSe registration 在缺少逐样本 gender 时默认使用 neutral SMPL。
+    # 预测驱动人体仍使用调用方指定 gender；评估参考人体与 canon_pose
+    # 必须使用同一个 neutral template。
     gt_betas = torch.from_numpy(
         np.asarray(target_data["betas"], dtype=np.float32)
     ).view(1, -1)
+    gt_model = smplx.create(
+        smpl_model_path, model_type='smpl', gender='neutral', ext='npz'
+    )
     with torch.no_grad():
-        gt_body_output = smpl_driver.model(
+        gt_body_output = gt_model(
             betas=gt_betas,
             body_pose=target_body_pose,
             global_orient=target_global_orient,
         )
     gt_target_body_verts = gt_body_output.vertices.squeeze(0).cpu().numpy().astype(np.float32)
-    dominant_joint = smpl_driver.model.lbs_weights.argmax(dim=1).cpu().numpy()
+    gt_template_verts = gt_model.v_template.detach().cpu().numpy().astype(np.float32)
+    dominant_joint = gt_model.lbs_weights.argmax(dim=1).cpu().numpy()
     torso_mask = np.isin(dominant_joint, [0, 3, 6, 9])
 
     # ---------- 布料仿真器 ----------
@@ -753,6 +758,7 @@ def drive_garment(
         'garment_faces': garment_faces,
         'target_body_v_m': target_body_verts,
         'gt_target_body_v_m': gt_target_body_verts,
+        'gt_template_v_m': gt_template_verts,
         'smpl_torso_mask': torso_mask,
         'target_body_f': body_faces,
         'align_offset_m': align_offset,

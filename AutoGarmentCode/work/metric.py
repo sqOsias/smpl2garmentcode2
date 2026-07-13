@@ -35,9 +35,91 @@ RANDOM_SEED = 42
 # CloSe 上装细类索引
 UPPER_LABELS = [2, 3, 4, 5, 11, 17]  # Shirt/TShirt/Vest/Coat/Hoodies/Jacket
 
-def close_points_to_metric(points: np.ndarray, scale: float, trans: np.ndarray) -> np.ndarray:
-    """归一化扫描坐标 -> SMPL 米制坐标 (transl=0 人体所在帧)。"""
-    return points / scale - trans.reshape(1, 3)
+def apply_similarity_transform(verts: np.ndarray, scale: float,
+                               R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """应用行向量形式的相似变换 ``v' = s * v @ R.T + t``。"""
+    return scale * (verts @ R.T) + t
+
+
+def umeyama_align(source: np.ndarray, target: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+    """求无反射的最小二乘相似变换 source → target。"""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError(f"Similarity inputs must have matching (N,3) shape, got {source.shape}, {target.shape}")
+    if len(source) < 3:
+        raise ValueError("At least three correspondences are required for similarity alignment")
+
+    src_mean = source.mean(axis=0)
+    dst_mean = target.mean(axis=0)
+    src_centered = source - src_mean
+    dst_centered = target - dst_mean
+    covariance = (src_centered.T @ dst_centered) / len(source)
+    U, singular_values, Vt = np.linalg.svd(covariance)
+    correction = np.ones(3, dtype=np.float64)
+    if np.linalg.det(Vt.T @ U.T) < 0:
+        correction[-1] = -1.0
+    R_mat = Vt.T @ np.diag(correction) @ U.T
+    src_variance = np.mean(np.sum(src_centered * src_centered, axis=1))
+    if src_variance <= 1e-12:
+        raise ValueError("Degenerate scan correspondences: near-zero source variance")
+    sim_scale = float(np.dot(singular_values, correction) / src_variance)
+    t_vec = dst_mean - sim_scale * (src_mean @ R_mat.T)
+    return sim_scale, R_mat, t_vec
+
+
+def estimate_scan_to_smpl_transform(data: dict, gt_body_v: np.ndarray,
+                                    gt_template_v: np.ndarray):
+    """用 canon_pose 对应和 Body 标签估计 scan-centered → SMPL-native。
+
+    不显式恢复缺失的 ``centers``，也不混用 NPZ 的包围盒归一化 scale
+    与原 registration scale；二者的影响由相似变换统一吸收。
+    """
+    points_metric = np.asarray(data['points'], dtype=np.float64) / float(data['scale'])
+    canon_pose = np.asarray(data['canon_pose'], dtype=np.float64)
+    labels = np.asarray(data['labels'])
+    gt_body_v = np.asarray(gt_body_v, dtype=np.float64)
+    gt_template_v = np.asarray(gt_template_v, dtype=np.float64)
+
+    if len(points_metric) != len(canon_pose) or len(points_metric) != len(labels):
+        raise ValueError("points, canon_pose and labels must contain the same number of vertices")
+
+    canon_dist, smpl_idx = cKDTree(gt_template_v).query(canon_pose, k=1, workers=-1)
+    valid = ((labels == 1) & np.isfinite(points_metric).all(axis=1)
+             & np.isfinite(canon_pose).all(axis=1) & np.isfinite(canon_dist))
+    if int(valid.sum()) < 100:
+        raise ValueError(f"Too few Body correspondences for scan alignment: {int(valid.sum())}")
+
+    # 模板版本可能产生微小差异；保留匹配误差最低的 95%，随后再按拟合残差裁剪。
+    canon_limit = np.quantile(canon_dist[valid], 0.95)
+    valid &= canon_dist <= canon_limit
+    source = points_metric[valid]
+    target = gt_body_v[smpl_idx[valid]]
+
+    keep = np.ones(len(source), dtype=bool)
+    for _ in range(3):
+        sim_scale, R_mat, t_vec = umeyama_align(source[keep], target[keep])
+        aligned = apply_similarity_transform(source, sim_scale, R_mat, t_vec)
+        residual = np.linalg.norm(aligned - target, axis=1)
+        residual_limit = np.quantile(residual[keep], 0.80)
+        keep &= residual <= residual_limit
+        if int(keep.sum()) < 100:
+            raise ValueError("Robust scan alignment rejected too many Body correspondences")
+
+    sim_scale, R_mat, t_vec = umeyama_align(source[keep], target[keep])
+    aligned = apply_similarity_transform(source[keep], sim_scale, R_mat, t_vec)
+    residual = np.linalg.norm(aligned - target[keep], axis=1)
+    diagnostics = {
+        'num_body_correspondences': int(keep.sum()),
+        'scale': sim_scale,
+        'rotation_deg': rotation_angle_deg(R_mat),
+        'translation': t_vec,
+        'canon_match_median_mm': float(np.median(canon_dist[valid]) * 1000.0),
+        'canon_match_p95_mm': float(np.quantile(canon_dist[valid], 0.95) * 1000.0),
+        'median_residual_cm': float(np.median(residual) * 100.0),
+        'p95_residual_cm': float(np.quantile(residual, 0.95) * 100.0),
+    }
+    return points_metric, sim_scale, R_mat, t_vec, diagnostics
 
 
 def _node_v(node, default=None):
@@ -352,18 +434,29 @@ def apply_rigid_transform(verts: np.ndarray, R: np.ndarray, t: np.ndarray) -> np
 
 # ==================== 5. GT 服装网格构建 (从 NPZ) ====================
 
-def build_gt_garment_mesh(data: dict, non_garment_labels: Tuple[int, ...]) -> trimesh.Trimesh:
-    """从 CloSe NPZ 数据中提取 GT 服装网格（SMPL 原生坐标系）。"""
+def build_gt_garment_mesh(data: dict, non_garment_labels: Tuple[int, ...],
+                          gt_body_v: np.ndarray,
+                          gt_template_v: np.ndarray) -> Tuple[trimesh.Trimesh, dict]:
+    """提取 GT 服装并通过人体对应关系变换到 GT SMPL 原生坐标系。"""
     labels = data['labels']
-    points = data['points']
     faces = data['faces']
-    scale = float(data['scale'])
-    trans = data['trans']
+    points_metric, sim_scale, R_scan, t_scan, alignment = estimate_scan_to_smpl_transform(
+        data, gt_body_v, gt_template_v
+    )
+    print(f"  Scan→SMPL scale: {alignment['scale']:.6f}")
+    print(f"  Scan→SMPL rotation: {alignment['rotation_deg']:.3f} deg")
+    print(f"  Scan→SMPL translation: {alignment['translation']}")
+    print(f"  Body correspondences: {alignment['num_body_correspondences']}")
+    print(f"  Canon match median/P95: {alignment['canon_match_median_mm']:.3f}/"
+          f"{alignment['canon_match_p95_mm']:.3f} mm")
+    print(f"  Body residual median/P95: {alignment['median_residual_cm']:.3f}/"
+          f"{alignment['p95_residual_cm']:.3f} cm")
 
-    # 服装顶点 → metric 坐标
+    # GT 服装与 GT SMPL 人体统一到同一个 native target-pose frame。
     gar_mask = ~np.isin(labels, non_garment_labels)
-    gar_pts = points[gar_mask] / scale - trans.reshape(1, 3)
-    # gar_pts = points[gar_mask]
+    gar_pts = apply_similarity_transform(
+        points_metric[gar_mask], sim_scale, R_scan, t_scan
+    )
 
     # 服装面片（三个顶点都是服装标签）
     gar_indices = np.where(gar_mask)[0]
@@ -400,7 +493,7 @@ def build_gt_garment_mesh(data: dict, non_garment_labels: Tuple[int, ...]) -> tr
     print(f"  Removed invalid/degenerate GT faces: {removed_faces}")
     if len(mesh.vertices) > 0:
         print(f"  GT garment Y=[{mesh.vertices[:, 1].min():.3f}, {mesh.vertices[:, 1].max():.3f}]")
-    return mesh
+    return mesh, alignment
 
 
 # ==================== 6. 距离指标 ====================
@@ -573,6 +666,7 @@ def evaluate_driven_garment(
     driven_faces: np.ndarray,
     pred_target_body_verts_m: np.ndarray,
     gt_target_body_verts_m: np.ndarray,
+    gt_template_verts_m: np.ndarray,
     gt_data: dict,
     torso_mask: Optional[np.ndarray] = None,
     output_dir: Optional[str] = None,
@@ -619,7 +713,9 @@ def evaluate_driven_garment(
     print(f"  Rotation: {rotation_angle_deg(R_body):.3f} deg")
     print(f"  Translation: {t_body}")
 
-    gt_mesh = build_gt_garment_mesh(gt_data, tuple(NON_GARMENT_LABELS))
+    gt_mesh, scan_alignment = build_gt_garment_mesh(
+        gt_data, tuple(NON_GARMENT_LABELS), gt_body, gt_template_verts_m
+    )
     if len(gt_mesh.vertices) == 0 or len(gt_mesh.faces) == 0:
         raise ValueError("GT garment mesh is empty after semantic filtering")
 
@@ -634,6 +730,7 @@ def evaluate_driven_garment(
     metrics = get_cd_fscore(pred_pts, gt_pts)
     metrics['fscore_10mm'] = metrics['fscores'][10]['fscore']
     metrics['alignment'] = {'R': R_body, 't': t_body}
+    metrics['scan_alignment'] = scan_alignment
     if output_dir is not None:
         save_metrics_to_csv(metrics, output_dir)
         export_results(pred_mesh, gt_mesh, pred_pts, gt_pts, output_dir)
@@ -662,18 +759,22 @@ def compute_cd_fscore(smpl_json: str, npz_path: str, garment_obj: str, gender: s
     with np.load(npz_path) as npz:
         gt_data = {key: npz[key] for key in npz.files}
     gt_pose = torch.from_numpy(np.asarray(gt_data['pose'], dtype=np.float32)).view(1, 72)
-    model = smplx.create(model_path=SMPL_MODEL_PATH, model_type='smpl', gender=gender)
+    # CloSe registration 在缺少逐样本 gender 时使用 neutral SMPL。
+    gt_model = smplx.create(
+        model_path=SMPL_MODEL_PATH, model_type='smpl', gender='neutral'
+    )
     with torch.no_grad():
-        gt_output = model(
+        gt_output = gt_model(
             betas=torch.from_numpy(np.asarray(gt_data['betas'], dtype=np.float32)).view(1, -1),
             body_pose=gt_pose[:, 3:],
             global_orient=gt_pose[:, :3],
         )
     gt_body = gt_output.vertices.squeeze(0).cpu().numpy()
-    dominant_joint = model.lbs_weights.argmax(dim=1).cpu().numpy()
+    gt_template = gt_model.v_template.detach().cpu().numpy()
+    dominant_joint = gt_model.lbs_weights.argmax(dim=1).cpu().numpy()
     torso_mask = np.isin(dominant_joint, [0, 3, 6, 9])
     return evaluate_driven_garment(
-        garment_v, garment_f, pred_body, gt_body, gt_data,
+        garment_v, garment_f, pred_body, gt_body, gt_template, gt_data,
         torso_mask=torso_mask, output_dir=output_dir,
     )
 
@@ -752,6 +853,7 @@ def evaluate_single_sample(args) -> Dict:
     metrics['chamfer_distance'] = cd_fscore['cd_cm']
     metrics['f_score'] = cd_fscore['fscores'][10]['fscore']
     metrics['fscores'] = cd_fscore['fscores']
+    metrics['scan_alignment'] = cd_fscore['scan_alignment']
 
     # ---- 5. 保存所有指标 ----
     save_metrics(metrics, output_dir)
