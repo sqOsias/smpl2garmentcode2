@@ -28,9 +28,10 @@ NON_GARMENT_LABELS = [0, 1, 10, 12, 13, 14, 15]
 
 # F-Score 正式距离阈值：论文勘误后采用 τ = 10mm = 0.010m
 DEFAULT_TAU = 0.010
+NORMALIZED_TAU = 0.01
 
 # 论文协议：在两个网格表面分别均匀采样 10000 点
-N_SAMPLE = 10000
+N_SAMPLE =10000
 RANDOM_SEED = 42
 # CloSe 上装细类索引
 UPPER_LABELS = [2, 3, 4, 5, 11, 17]  # Shirt/TShirt/Vest/Coat/Hoodies/Jacket
@@ -75,7 +76,16 @@ def estimate_scan_to_smpl_transform(data: dict, gt_body_v: np.ndarray,
     不显式恢复缺失的 ``centers``，也不混用 NPZ 的包围盒归一化 scale
     与原 registration scale；二者的影响由相似变换统一吸收。
     """
-    points_metric = np.asarray(data['points'], dtype=np.float64) / float(data['scale'])
+    npz_scale_values = np.asarray(data['scale'], dtype=np.float64).reshape(-1)
+    if npz_scale_values.size != 1:
+        raise ValueError(
+            f"CloSe scale must be scalar, got shape {np.asarray(data['scale']).shape}"
+        )
+    npz_scale = float(npz_scale_values[0])
+    if not np.isfinite(npz_scale) or npz_scale <= 0.0:
+        raise ValueError(f"CloSe scale must be finite and positive, got {npz_scale}")
+
+    points_metric = np.asarray(data['points'], dtype=np.float64) / npz_scale
     canon_pose = np.asarray(data['canon_pose'], dtype=np.float64)
     labels = np.asarray(data['labels'])
     gt_body_v = np.asarray(gt_body_v, dtype=np.float64)
@@ -118,6 +128,10 @@ def estimate_scan_to_smpl_transform(data: dict, gt_body_v: np.ndarray,
         'canon_match_p95_mm': float(np.quantile(canon_dist[valid], 0.95) * 1000.0),
         'median_residual_cm': float(np.median(residual) * 100.0),
         'p95_residual_cm': float(np.quantile(residual, 0.95) * 100.0),
+        'npz_scale': npz_scale,
+        # CloSe normalized the full scan longest side to one.  The Umeyama
+        # scale maps that original scan length into the current SMPL frame.
+        'normalization_length_m': sim_scale / npz_scale,
     }
     return points_metric, sim_scale, R_mat, t_vec, diagnostics
 
@@ -502,6 +516,73 @@ def rotation_angle_deg(R: np.ndarray) -> float:
     cos = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
     return float(np.degrees(np.arccos(cos)))
 
+def normalize_close_point_pair(
+    pred_pts: np.ndarray,
+    gt_pts: np.ndarray,
+    normalization_length_m: float,
+    common_center_m: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Normalize both point sets with the same CloSe full-scan transform.
+
+    ``normalization_length_m`` is the original full-scan longest side after
+    Scan-to-SMPL registration.  Never derive separate scales from the two
+    garment bounding boxes: doing so would remove real size errors.
+    """
+    pred_pts = np.asarray(pred_pts, dtype=np.float64)
+    gt_pts = np.asarray(gt_pts, dtype=np.float64)
+    length = float(normalization_length_m)
+    center = np.asarray(common_center_m, dtype=np.float64).reshape(-1)
+
+    if not np.isfinite(length) or length <= 0.0:
+        raise ValueError(f"normalization_length_m must be finite and positive, got {length}")
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError(f"common_center_m must contain three finite values, got {center}")
+
+    return (pred_pts - center) / length, (gt_pts - center) / length
+
+
+def get_normalized_cd_fscore(
+    pred_pts_norm: np.ndarray,
+    gt_pts_norm: np.ndarray,
+    tau: float = NORMALIZED_TAU,
+) -> Dict:
+    """Compute linear-distance CD/F-Score in the shared normalized frame."""
+    pred_pts_norm = np.asarray(pred_pts_norm, dtype=np.float64)
+    gt_pts_norm = np.asarray(gt_pts_norm, dtype=np.float64)
+    tau = float(tau)
+
+    for name, points in (("pred_pts_norm", pred_pts_norm), ("gt_pts_norm", gt_pts_norm)):
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            raise ValueError(f"{name} must be a non-empty (N, 3) array, got {points.shape}")
+        if not np.isfinite(points).all():
+            raise ValueError(f"{name} contains NaN or Inf")
+    if not np.isfinite(tau) or tau <= 0.0:
+        raise ValueError(f"Normalized tau must be finite and positive, got {tau}")
+
+    p2g = cKDTree(gt_pts_norm).query(pred_pts_norm, k=1, workers=-1)[0]
+    g2p = cKDTree(pred_pts_norm).query(gt_pts_norm, k=1, workers=-1)[0]
+    cd = 0.5 * (p2g.mean() + g2p.mean())
+    precision = float((p2g <= tau).mean())
+    recall = float((g2p <= tau).mean())
+    fscore = (
+        2.0 * precision * recall / (precision + recall)
+        if precision + recall > 0.0 else 0.0
+    )
+
+    print(f"\n  CloSe normalized CD = {cd:.6f}")
+    print(
+        f"  CloSe normalized F@{tau:g} = {fscore:.4f}  "
+        f"(P={precision * 100:.1f}%, R={recall * 100:.1f}%)"
+    )
+    return {
+        'cd': float(cd),
+        'tau': tau,
+        'fscore': float(fscore),
+        'precision': precision,
+        'recall': recall,
+    }
+
+
 def get_cd_fscore(pred_pts: np.ndarray, gt_pts: np.ndarray,
                     thresholds_mm: Tuple[int, ...] = (5, 10, 20, 30, 50)):
     """计算 CD 和多阈值 F-Score。
@@ -547,9 +628,26 @@ def save_metrics_to_csv(metrics: dict, output_dir: str, filename: str = "metrics
     csv_path = os.path.join(output_dir, filename)
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["cd_cm"] + [f"F-Score@{t}mm" for t in (5,10,20,30,50)])
+        writer.writerow([
+            "cd_cm",
+            "normalized_cd",
+            "normalized_tau",
+            "normalized_effective_tau_mm",
+            "normalized_fscore",
+            "normalized_precision",
+            "normalized_recall",
+        ] + [f"F-Score@{t}mm" for t in (5,10,20,30,50)])
         fs = metrics['fscores']
-        writer.writerow([f"{metrics['cd_cm']:.4f}"] + [f"{fs[t]['fscore']:.4f}" for t in (5,10,20,30,50)])
+        normalized = metrics['normalized']
+        writer.writerow([
+            f"{metrics['cd_cm']:.4f}",
+            f"{normalized['cd']:.6f}",
+            f"{normalized['tau']:.6f}",
+            f"{normalized['effective_tau_mm']:.4f}",
+            f"{normalized['fscore']:.4f}",
+            f"{normalized['precision']:.4f}",
+            f"{normalized['recall']:.4f}",
+        ] + [f"{fs[t]['fscore']:.4f}" for t in (5,10,20,30,50)])
     print(f"  CD/F-Score saved to {csv_path}")
 
 
@@ -589,6 +687,13 @@ def save_metrics(full_metrics: dict, output_dir: str):
         "bottom_correct",
         "connected_correct",
         "chamfer_distance_cm",
+        "normalized_cd",
+        "normalized_tau",
+        "normalized_effective_tau_mm",
+        "normalized_fscore",
+        "normalized_precision",
+        "normalized_recall",
+        "f_score_protocol",
     ]
     # 添加多阈值 F-Score
     thresholds = [5, 10, 20, 30, 50]
@@ -598,6 +703,7 @@ def save_metrics(full_metrics: dict, output_dir: str):
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(columns)
+        normalized = full_metrics.get('normalized_metrics', {})
         row = [
             full_metrics.get('sample_name', ''),
             f"{full_metrics.get('valid_structure', 0):.4f}",
@@ -607,6 +713,13 @@ def save_metrics(full_metrics: dict, output_dir: str):
             f"{full_metrics.get('bottom_correct', 0):.4f}",
             f"{full_metrics.get('connected_correct', 0):.4f}",
             f"{full_metrics.get('chamfer_distance', 0):.4f}" if full_metrics.get('chamfer_distance') is not None else "",
+            f"{normalized.get('cd', 0):.6f}" if normalized else "",
+            f"{normalized.get('tau', 0):.6f}" if normalized else "",
+            f"{normalized.get('effective_tau_mm', 0):.4f}" if normalized else "",
+            f"{normalized.get('fscore', 0):.4f}" if normalized else "",
+            f"{normalized.get('precision', 0):.4f}" if normalized else "",
+            f"{normalized.get('recall', 0):.4f}" if normalized else "",
+            full_metrics.get('f_score_protocol', ''),
         ]
         for t in thresholds:
             fs = full_metrics.get('fscores', {}).get(t, {})
@@ -727,7 +840,33 @@ def evaluate_driven_garment(
     print(f"\n  Pred garment Y=[{pred_pts[:, 1].min():.3f}, {pred_pts[:, 1].max():.3f}]")
     print(f"  GT garment Y=[{gt_pts[:, 1].min():.3f}, {gt_pts[:, 1].max():.3f}]")
 
+    # Apply one shared full-scan normalization before computing the formal
+    # CloSe metric.  Physical-unit metrics are retained below as diagnostics.
+    normalization_length_m = float(scan_alignment['normalization_length_m'])
+    normalization_center_m = np.asarray(scan_alignment['translation'], dtype=np.float64)
+    pred_pts_norm, gt_pts_norm = normalize_close_point_pair(
+        pred_pts,
+        gt_pts,
+        normalization_length_m=normalization_length_m,
+        common_center_m=normalization_center_m,
+    )
+    normalized = get_normalized_cd_fscore(
+        pred_pts_norm,
+        gt_pts_norm,
+        tau=NORMALIZED_TAU,
+    )
+    effective_tau_mm = normalized['tau'] * normalization_length_m * 1000.0
+    normalized['effective_tau_mm'] = float(effective_tau_mm)
+    normalized['normalization_length_m'] = normalization_length_m
+    normalized['npz_scale'] = float(scan_alignment['npz_scale'])
+    normalized['scan_to_smpl_scale'] = float(scan_alignment['scale'])
+    normalized['protocol'] = 'close_full_scan_normalized_linear_distance'
+    print(f"  Full-scan normalization length = {normalization_length_m:.6f} m")
+    print(f"  Effective physical tau = {effective_tau_mm:.3f} mm")
+
     metrics = get_cd_fscore(pred_pts, gt_pts)
+    metrics['normalized'] = normalized
+    metrics['fscore_normalized_0p01'] = normalized['fscore']
     metrics['fscore_10mm'] = metrics['fscores'][10]['fscore']
     metrics['alignment'] = {'R': R_body, 't': t_body}
     metrics['scan_alignment'] = scan_alignment
@@ -851,7 +990,10 @@ def evaluate_single_sample(args) -> Dict:
                                   gender,
                                   output_dir)
     metrics['chamfer_distance'] = cd_fscore['cd_cm']
-    metrics['f_score'] = cd_fscore['fscores'][10]['fscore']
+    metrics['f_score'] = cd_fscore['normalized']['fscore']
+    metrics['f_score_protocol'] = cd_fscore['normalized']['protocol']
+    metrics['normalized_metrics'] = cd_fscore['normalized']
+    metrics['fscore_10mm'] = cd_fscore['fscore_10mm']
     metrics['fscores'] = cd_fscore['fscores']
     metrics['scan_alignment'] = cd_fscore['scan_alignment']
 

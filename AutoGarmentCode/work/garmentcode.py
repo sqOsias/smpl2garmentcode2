@@ -172,7 +172,10 @@ if __name__ == '__main__':
 			'bottom_correct': float(correct['bottom']),
 			'connected_correct': float(correct['connected']),
 			'chamfer_distance': geometry_metrics['cd_cm'],
-			'f_score': geometry_metrics['fscore_10mm'],
+			'f_score': geometry_metrics['normalized']['fscore'],
+			'f_score_protocol': geometry_metrics['normalized']['protocol'],
+			'normalized_metrics': geometry_metrics['normalized'],
+			'fscore_10mm': geometry_metrics['fscore_10mm'],
 			'fscores': geometry_metrics['fscores'],
 			'scan_alignment': geometry_metrics['scan_alignment'],
 		}
