@@ -61,6 +61,112 @@ def load_sim_config(yaml_path):
     return config["sim"]["config"]
 
 
+def _resolve_obj_index(raw_index, count, field_name, obj_path):
+    """Resolve a one-based (or negative) OBJ index to a zero-based index."""
+    index = int(raw_index)
+    resolved = index - 1 if index > 0 else count + index
+    if resolved < 0 or resolved >= count:
+        raise ValueError(
+            f"Invalid {field_name} index {index} in {obj_path}; "
+            f"the file contains {count} {field_name} entries"
+        )
+    return resolved
+
+
+def _load_obj_topology(obj_path):
+    """Load OBJ positions, UVs and their independent face indices.
+
+    BoxMesh has already collapsed actual pattern stitches before serializing the
+    OBJ.  Reading the position indices directly therefore preserves the sewn
+    physical topology, while keeping the per-panel UV seams separate.  This
+    avoids Trimesh expanding vertices for UV seams and a later coordinate-based
+    merge accidentally welding unrelated, coincident garment layers.
+    """
+    vertices = []
+    uvs = []
+    faces = []
+    face_uvs = []
+
+    with open(obj_path, "r", encoding="utf-8") as obj_file:
+        for line_number, line in enumerate(obj_file, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            fields = stripped.split()
+            record = fields[0]
+
+            if record == "v" and len(fields) >= 4:
+                vertices.append([float(fields[1]), float(fields[2]), float(fields[3])])
+            elif record == "vt" and len(fields) >= 3:
+                uvs.append([float(fields[1]), float(fields[2])])
+            elif record == "f":
+                if len(fields) < 4:
+                    raise ValueError(f"Invalid face at {obj_path}:{line_number}")
+
+                position_indices = []
+                texture_indices = []
+                for corner in fields[1:]:
+                    components = corner.split("/")
+                    if not components[0]:
+                        raise ValueError(
+                            f"Missing position index at {obj_path}:{line_number}"
+                        )
+                    position_indices.append(
+                        _resolve_obj_index(components[0], len(vertices), "vertex", obj_path)
+                    )
+                    if len(components) > 1 and components[1]:
+                        texture_indices.append(
+                            _resolve_obj_index(components[1], len(uvs), "texture", obj_path)
+                        )
+                    else:
+                        texture_indices.append(-1)
+
+                # BoxMesh writes triangles, but fan triangulation keeps the
+                # loader well-defined if a compatible OBJ contains polygons.
+                for corner_idx in range(1, len(position_indices) - 1):
+                    tri = [0, corner_idx, corner_idx + 1]
+                    faces.append([position_indices[idx] for idx in tri])
+                    face_uvs.append([texture_indices[idx] for idx in tri])
+
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int32)
+    uvs = np.asarray(uvs, dtype=np.float32).reshape(-1, 2)
+    face_uvs = np.asarray(face_uvs, dtype=np.int32).reshape(-1, 3)
+
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+        raise ValueError(f"OBJ contains no valid vertices: {obj_path}")
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+        raise ValueError(f"OBJ contains no valid triangle faces: {obj_path}")
+
+    return vertices, faces, uvs, face_uvs
+
+
+def _load_stitched_garment_topology(garment_obj_path, boxmesh_obj_path):
+    """Load one shared BoxMesh topology for simulation and UV export."""
+    garment_vertices, garment_faces, _, _ = _load_obj_topology(garment_obj_path)
+    template_vertices, template_faces, template_uvs, template_face_uvs = (
+        _load_obj_topology(boxmesh_obj_path)
+    )
+
+    if len(garment_vertices) != len(template_vertices):
+        raise ValueError(
+            "Garment and BoxMesh template vertex counts differ: "
+            f"{len(garment_vertices)} != {len(template_vertices)}. "
+            "They must originate from the same BoxMesh serialization."
+        )
+    if garment_faces.shape != template_faces.shape or not np.array_equal(
+        garment_faces, template_faces
+    ):
+        raise ValueError(
+            "Garment and BoxMesh template position topology differ. "
+            "Refusing to drive with an ambiguous vertex/UV mapping."
+        )
+    if len(template_uvs) == 0 or np.any(template_face_uvs < 0):
+        raise ValueError(f"BoxMesh template has incomplete UV indices: {boxmesh_obj_path}")
+
+    return garment_vertices, garment_faces, template_uvs, template_face_uvs
+
+
 def build_cloth_springs(verts, faces):
     """从服装三角网格构建弹簧系统。返回结构边、弯曲边及其原长。"""
     num_verts = len(verts)
@@ -439,31 +545,43 @@ class WarpClothSimulator:
 # 5. UV 恢复工具
 # ======================================
 
-def _export_driven_obj_with_uv(out_path, driven_verts_m, boxmesh_obj_path):
-    """将驱动后的顶点位置写入 OBJ，从 boxmesh 模板继承 UV 和面片信息。
+def _export_driven_obj_with_uv(
+    out_path, driven_verts_m, garment_faces, template_uvs, template_face_uvs
+):
+    """使用 BoxMesh 的独立位置/UV 索引导出驱动后的 OBJ。
 
     Args:
         out_path: 输出 OBJ 路径
         driven_verts_m: 驱动后顶点 (米)
-        boxmesh_obj_path: boxmesh 模板 OBJ 路径 (含 UV / face)
+        garment_faces: BoxMesh 已缝合的物理面索引
+        template_uvs: BoxMesh 模板的纹理坐标
+        template_face_uvs: 每个物理面的独立纹理坐标索引
     """
-    orig = trimesh.load(boxmesh_obj_path, process=False)
-    orig.merge_vertices(merge_tex=True, merge_norm=True)
-    merged_uv = orig.visual.uv
-    merged_faces = orig.faces
+    if len(garment_faces) != len(template_face_uvs):
+        raise ValueError(
+            "Physical face count and UV face count differ during OBJ export: "
+            f"{len(garment_faces)} != {len(template_face_uvs)}"
+        )
+    if len(garment_faces) and int(np.max(garment_faces)) >= len(driven_verts_m):
+        raise ValueError("Physical face index exceeds driven garment vertex count")
+    if len(template_face_uvs) and int(np.max(template_face_uvs)) >= len(template_uvs):
+        raise ValueError("Texture face index exceeds BoxMesh UV count")
 
     driven_cm = driven_verts_m * 100.0  # m → cm (匹配 OBJ 约定)
 
-    with open(out_path, 'w') as f:
+    with open(out_path, 'w', encoding='utf-8') as f:
         f.write("mtllib design_material.mtl\n")
         f.write("usemtl panels_texture\n")
         for v in driven_cm:
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-        for u in merged_uv:
+        for u in template_uvs:
             f.write(f"vt {u[0]:.6f} {u[1]:.6f}\n")
-        for face in merged_faces:
-            a, b, c = int(face[0]) + 1, int(face[1]) + 1, int(face[2]) + 1
-            f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
+        for face, face_uv in zip(garment_faces, template_face_uvs):
+            corners = [
+                f"{int(vertex_idx) + 1}/{int(uv_idx) + 1}"
+                for vertex_idx, uv_idx in zip(face, face_uv)
+            ]
+            f.write(f"f {' '.join(corners)}\n")
 
 
 def _copy_material_files(src_dir, dst_dir):
@@ -538,11 +656,14 @@ def drive_garment(
     print("[driver] 仿真配置加载完成")
 
     # ---------- 加载服装 (cm → m) ----------
-    garment_mesh = trimesh.load(garment_obj_path, process=False)
-    garment_mesh.merge_vertices(merge_tex=True, merge_norm=True)
-    garment_verts_m = np.array(garment_mesh.vertices, dtype=np.float32) * GARMENT_SCALE
-    garment_faces = np.array(garment_mesh.faces, dtype=np.int32)
+    # BoxMesh 已按纸样缝合关系折叠物理顶点。直接复用 OBJ 的 position
+    # indices，并单独保存 UV indices；不再执行基于坐标的全局 merge。
+    garment_verts_cm, garment_faces, template_uvs, template_face_uvs = (
+        _load_stitched_garment_topology(garment_obj_path, boxmesh_obj_path)
+    )
+    garment_verts_m = garment_verts_cm * GARMENT_SCALE
     print(f"[driver] 服装: {len(garment_verts_m)} 顶点, {len(garment_faces)} 面")
+    print("[driver] 拓扑: 复用 BoxMesh 缝合 position indices，UV indices 独立保留")
 
     # ---------- 加载参考人体 (米) ----------
     body_mesh = trimesh.load(body_obj_path, process=False)
@@ -729,7 +850,13 @@ def drive_garment(
 
     # ---------- 保存最终结果 (m → cm, 带 UV) ----------
     final_obj_path = os.path.join(output_dir, "final_result.obj")
-    _export_driven_obj_with_uv(final_obj_path, cloth_verts_m, boxmesh_obj_path)
+    _export_driven_obj_with_uv(
+        final_obj_path,
+        cloth_verts_m,
+        garment_faces,
+        template_uvs,
+        template_face_uvs,
+    )
     _copy_material_files(os.path.dirname(garment_obj_path), output_dir)
     print(f"[driver] 带 UV 的最终 OBJ → {final_obj_path}")
 
