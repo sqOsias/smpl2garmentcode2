@@ -584,6 +584,190 @@ def _export_driven_obj_with_uv(
             f.write(f"f {' '.join(corners)}\n")
 
 
+def _classify_pattern_panel(panel_name, panel_spec):
+    """Classify a generated pattern panel as upper or lower garment."""
+    name = panel_name.lower()
+    semantic_label = str(panel_spec.get("label", "")).lower()
+
+    lower_hints = (
+        "pant", "trouser", "short", "skirt", "leg", "bottom",
+        "waistband", "waist_band", "wb",
+    )
+    upper_hints = (
+        "torso", "sleeve", "shirt", "top", "hood", "collar",
+        "coat", "jacket", "vest", "arm",
+    )
+
+    if any(hint in name for hint in lower_hints):
+        return "lower"
+    if any(hint in name for hint in upper_hints):
+        return "upper"
+    if "leg" in semantic_label:
+        return "lower"
+    if any(hint in semantic_label for hint in ("body", "torso", "arm")):
+        return "upper"
+    return None
+
+
+def _find_boxmesh_metadata(boxmesh_obj_path):
+    """Locate segmentation and specification files belonging to a BoxMesh OBJ."""
+    mesh_dir = os.path.dirname(boxmesh_obj_path)
+    filename = os.path.basename(boxmesh_obj_path)
+    suffix = "_boxmesh.obj"
+    if not filename.endswith(suffix):
+        raise ValueError(
+            f"Cannot infer BoxMesh tag from filename: {boxmesh_obj_path}"
+        )
+    tag = filename[:-len(suffix)]
+    segmentation_path = os.path.join(mesh_dir, f"{tag}_sim_segmentation.txt")
+    specification_candidates = [
+        os.path.join(mesh_dir, f"{tag}_specification.json"),
+        os.path.join(os.path.dirname(mesh_dir), f"{tag}_specification.json"),
+    ]
+    specification_path = next(
+        (path for path in specification_candidates if os.path.exists(path)), None
+    )
+
+    if not os.path.exists(segmentation_path):
+        raise FileNotFoundError(
+            f"Missing BoxMesh vertex segmentation: {segmentation_path}"
+        )
+    if specification_path is None:
+        raise FileNotFoundError(
+            "Missing BoxMesh design specification; checked: "
+            + ", ".join(specification_candidates)
+        )
+    return segmentation_path, specification_path
+
+
+def _derive_upper_lower_face_masks(
+    garment_faces, template_face_uvs, boxmesh_obj_path, num_vertices
+):
+    """Assign UV-connected paper-pattern panels to upper/lower face masks."""
+    segmentation_path, specification_path = _find_boxmesh_metadata(boxmesh_obj_path)
+    with open(specification_path, "r", encoding="utf-8") as spec_file:
+        specification = json.load(spec_file)
+    pattern = specification.get("pattern", {})
+    panels = pattern.get("panels", {})
+    stitches = pattern.get("stitches", [])
+    if not panels:
+        raise ValueError(f"No pattern panels found in {specification_path}")
+
+    panel_parts = {
+        panel_name: _classify_pattern_panel(panel_name, panel_spec)
+        for panel_name, panel_spec in panels.items()
+    }
+    unknown_panels = sorted(name for name, part in panel_parts.items() if part is None)
+    if unknown_panels:
+        raise ValueError(
+            "Cannot classify pattern panels as upper/lower: "
+            + ", ".join(unknown_panels)
+        )
+
+    stitch_parts = {}
+    for stitch_idx, stitch in enumerate(stitches):
+        connected_panels = {
+            side.get("panel") for side in stitch if isinstance(side, dict)
+        }
+        connected_panels.discard(None)
+        stitch_parts[f"stitch_{stitch_idx}"] = {
+            panel_parts[name] for name in connected_panels if name in panel_parts
+        }
+
+    vertex_parts = []
+    with open(segmentation_path, "r", encoding="utf-8") as segmentation_file:
+        for line in segmentation_file:
+            labels = [label.strip() for label in line.strip().split(",") if label.strip()]
+            parts = set()
+            for label in labels:
+                if label in panel_parts:
+                    parts.add(panel_parts[label])
+                elif label in stitch_parts:
+                    parts.update(stitch_parts[label])
+            vertex_parts.append(parts)
+
+    if len(vertex_parts) != num_vertices:
+        raise ValueError(
+            "BoxMesh segmentation length does not match physical vertex count: "
+            f"{len(vertex_parts)} != {num_vertices}"
+        )
+
+    # Faces belonging to one paper panel share UV indices.  Different panels
+    # have independent UV islands even when their physical seam vertices are
+    # shared, so UV connectivity gives an unambiguous panel-level grouping.
+    num_faces = len(garment_faces)
+    parent = np.arange(num_faces, dtype=np.int32)
+
+    def find(face_idx):
+        while parent[face_idx] != face_idx:
+            parent[face_idx] = parent[parent[face_idx]]
+            face_idx = int(parent[face_idx])
+        return face_idx
+
+    def union(face_a, face_b):
+        root_a, root_b = find(face_a), find(face_b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    uv_owner = {}
+    for face_idx, uv_face in enumerate(template_face_uvs):
+        for uv_idx in uv_face:
+            uv_idx = int(uv_idx)
+            previous = uv_owner.setdefault(uv_idx, face_idx)
+            union(face_idx, previous)
+
+    component_faces = {}
+    for face_idx in range(num_faces):
+        component_faces.setdefault(find(face_idx), []).append(face_idx)
+
+    face_parts = np.empty(num_faces, dtype=object)
+    for component in component_faces.values():
+        votes = {"upper": 0, "lower": 0}
+        for face_idx in component:
+            for vertex_idx in garment_faces[face_idx]:
+                parts = vertex_parts[int(vertex_idx)]
+                for part in parts:
+                    votes[part] += 1
+        if votes["upper"] == votes["lower"]:
+            raise ValueError(
+                "Unable to classify a UV-connected pattern panel: "
+                f"upper/lower votes are tied at {votes['upper']}"
+            )
+        component_part = "upper" if votes["upper"] > votes["lower"] else "lower"
+        face_parts[component] = component_part
+
+    upper_mask = face_parts == "upper"
+    lower_mask = face_parts == "lower"
+    return upper_mask, lower_mask
+
+
+def _export_driven_obj_subset_with_uv(
+    out_path, driven_verts_m, garment_faces, template_uvs, template_face_uvs, face_mask
+):
+    """Export a compact face subset while preserving independent UV indices."""
+    selected_faces = garment_faces[face_mask]
+    selected_face_uvs = template_face_uvs[face_mask]
+    used_vertices = np.unique(selected_faces.reshape(-1))
+    used_uvs = np.unique(selected_face_uvs.reshape(-1))
+
+    vertex_remap = np.full(len(driven_verts_m), -1, dtype=np.int32)
+    vertex_remap[used_vertices] = np.arange(len(used_vertices), dtype=np.int32)
+    uv_remap = np.full(len(template_uvs), -1, dtype=np.int32)
+    uv_remap[used_uvs] = np.arange(len(used_uvs), dtype=np.int32)
+
+    compact_vertices_m = driven_verts_m[used_vertices]
+    compact_uvs = template_uvs[used_uvs]
+    compact_faces = vertex_remap[selected_faces]
+    compact_face_uvs = uv_remap[selected_face_uvs]
+    _export_driven_obj_with_uv(
+        out_path,
+        compact_vertices_m,
+        compact_faces,
+        compact_uvs,
+        compact_face_uvs,
+    )
+
+
 def _copy_material_files(src_dir, dst_dir):
     """复制 MTL 和纹理文件到目标目录。"""
     for fname in ["design_material.mtl", "design_texture.png", "design_texture_fabric.png"]:
@@ -860,6 +1044,43 @@ def drive_garment(
     _copy_material_files(os.path.dirname(garment_obj_path), output_dir)
     print(f"[driver] 带 UV 的最终 OBJ → {final_obj_path}")
 
+    # 使用纸样面片/接缝元数据分别导出上装和下装。共享腰线顶点在两个
+    # 子网格中各自重映射，不改变用于物理仿真的共享拓扑。
+    upper_face_mask, lower_face_mask = _derive_upper_lower_face_masks(
+        garment_faces,
+        template_face_uvs,
+        boxmesh_obj_path,
+        len(cloth_verts_m),
+    )
+    upper_obj_path = None
+    lower_obj_path = None
+    if np.any(upper_face_mask):
+        upper_obj_path = os.path.join(output_dir, "final_result_upper.obj")
+        _export_driven_obj_subset_with_uv(
+            upper_obj_path,
+            cloth_verts_m,
+            garment_faces,
+            template_uvs,
+            template_face_uvs,
+            upper_face_mask,
+        )
+        print(f"[driver] 上装 OBJ → {upper_obj_path}")
+    else:
+        print("[driver] 当前纸样不包含上装，跳过上装 OBJ 导出")
+    if np.any(lower_face_mask):
+        lower_obj_path = os.path.join(output_dir, "final_result_lower.obj")
+        _export_driven_obj_subset_with_uv(
+            lower_obj_path,
+            cloth_verts_m,
+            garment_faces,
+            template_uvs,
+            template_face_uvs,
+            lower_face_mask,
+        )
+        print(f"[driver] 下装 OBJ → {lower_obj_path}")
+    else:
+        print("[driver] 当前纸样不包含下装，跳过下装 OBJ 导出")
+
     # 保存简化版 (米, 纯顶点)
     final_mesh = trimesh.Trimesh(vertices=cloth_verts_m, faces=garment_faces, process=False)
     final_mesh.export(os.path.join(output_dir, "final_result_meters.obj"))
@@ -904,6 +1125,8 @@ def drive_garment(
 
     return {
         'driven_obj': final_obj_path,
+        'driven_upper_obj': upper_obj_path,
+        'driven_lower_obj': lower_obj_path,
         'driven_verts_m': cloth_verts_m,
         'garment_faces': garment_faces,
         'target_body_v_m': target_body_verts,
